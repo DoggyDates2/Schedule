@@ -21,7 +21,7 @@ class DogReassignmentSystem:
         """Initialize the dog reassignment system"""
         # Google Sheets URLs (CSV export format)
         self.DISTANCE_MATRIX_URL = "https://docs.google.com/spreadsheets/d/1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg/export?format=csv&gid=398422902"
-        self.MAP_SHEET_URL = "https://docs.google.com/spreadsheets/d/1mg8d5CLxSR54KhNUL8SpL5jzrGN-bghTsC9vxSK8lR0/export?format=csv&gid=267803750"
+        self.MAP_SHEET_URL = "https://docs.google.com/spreadsheets/d/1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U/export?format=csv&gid=267803750"
         
         # DISTANCE LIMITS - LOCALITY-FIRST THRESHOLDS
         self.PREFERRED_DISTANCE = 0.2  # Ideal assignments: immediate proximity
@@ -1234,7 +1234,7 @@ class DogReassignmentSystem:
             print(f"✅ Pre-validation passed!")
             
             # Extract sheet ID
-            sheet_id = "1mg8d5CLxSR54KhNUL8SpL5jzrGN-bghTsC9vxSK8lR0"
+            sheet_id = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
             
             # Open the spreadsheet
             spreadsheet = self.sheets_client.open_by_key(sheet_id)
