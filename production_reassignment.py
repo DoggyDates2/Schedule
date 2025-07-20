@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Dog Assignment Optimization System - Production Ready
-Based on existing patterns from your script with all fixes applied
+Complete rewrite with all fixes and correct Google Sheets IDs
+Matrix Sheet: 1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg
+Map Sheet: 1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U
 """
 
 import os
@@ -25,11 +27,22 @@ logger = logging.getLogger(__name__)
 
 
 class DogReassignmentSystem:
-    """Enhanced dog reassignment system with all optimizations"""
+    """Enhanced dog reassignment system with all optimizations
+    
+    This system connects to two separate Google Sheets:
+    1. Matrix spreadsheet - contains dog-to-dog distances
+    2. Map spreadsheet - contains assignments, drivers, and capacities
+    """
     
     def __init__(self):
         """Initialize the dog reassignment system"""
         print("🚀 Enhanced Dog Reassignment System - WITH DOG SWAPPING OPTIMIZATION")
+        
+        # Google Sheets IDs
+        self.MATRIX_SHEET_ID = "1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg"
+        self.MAP_SHEET_ID = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
+        self.MATRIX_TAB = "Matrix"  # Update if your tab name is different
+        self.MAP_TAB = "Map"        # Update if your tab name is different
         
         # Initialize Google Sheets connection
         self.setup_google_sheets()
@@ -122,7 +135,7 @@ class DogReassignmentSystem:
     def load_distance_matrix(self):
         """Load the distance matrix from Google Sheets"""
         try:
-            sheet = self.gc.open("DoggyDates Schedule").worksheet("Matrix")
+            sheet = self.gc.open_by_key(self.MATRIX_SHEET_ID).worksheet(self.MATRIX_TAB)
             all_values = sheet.get_all_values()
             
             # First row contains dog IDs (skip first cell)
@@ -159,7 +172,7 @@ class DogReassignmentSystem:
     def load_dog_assignments(self):
         """Load dog assignments from Google Sheets - using YOUR EXACT format"""
         try:
-            sheet = self.gc.open("DoggyDates Schedule").worksheet("Map")
+            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
             all_values = sheet.get_all_values()
             
             # Find column indices from headers (based on your existing code)
@@ -784,7 +797,7 @@ class DogReassignmentSystem:
         try:
             print("\n📝 Writing results to Google Sheets...")
             
-            sheet = self.gc.open("DoggyDates Schedule").worksheet("Map")
+            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
             
             # Get current data
             all_values = sheet.get_all_values()
@@ -907,3 +920,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# This script is now configured with your specific Google Sheets IDs
+# Ready to run: python production_reassignment.py
