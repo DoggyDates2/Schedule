@@ -143,18 +143,22 @@ class DogReassignmentSystem:
             
             self.distance_matrix = {}
             
+            # Check if IDs have 'x' suffix
+            self.matrix_has_x_suffix = any(str(id).endswith('x') for id in dog_ids[:10] if id)
+            
             for i, row in enumerate(all_values[1:]):
-                from_dog_id = row[0]
+                from_dog_id = str(row[0]).strip()
                 if not from_dog_id:
                     continue
                 
+                # Store with original format from matrix
                 self.distance_matrix[from_dog_id] = {}
                 
                 for j, distance_str in enumerate(row[1:]):
                     if j < len(dog_ids):
-                        to_dog_id = dog_ids[j]
+                        to_dog_id = str(dog_ids[j]).strip()
                         try:
-                            distance = float(distance_str)
+                            distance = float(distance_str) if distance_str else self.EXCLUSION_DISTANCE
                         except (ValueError, TypeError):
                             distance = self.EXCLUSION_DISTANCE
                         
@@ -164,6 +168,8 @@ class DogReassignmentSystem:
                         self.distance_matrix[from_dog_id][to_dog_id] = distance
             
             print(f"✅ Loaded distance matrix with {len(self.distance_matrix)} dogs")
+            if self.matrix_has_x_suffix:
+                print("   ℹ️  Note: Matrix IDs have 'x' suffix (e.g., '1x', '2x')")
             
         except Exception as e:
             print(f"❌ Error loading distance matrix: {e}")
@@ -326,12 +332,23 @@ class DogReassignmentSystem:
         if dog1_id == dog2_id:
             return 0.0
         
-        if dog1_id not in self.distance_matrix:
-            return self.EXCLUSION_DISTANCE
-        if dog2_id not in self.distance_matrix[dog1_id]:
-            return self.EXCLUSION_DISTANCE
-        
-        distance = self.distance_matrix[dog1_id].get(dog2_id, self.EXCLUSION_DISTANCE)
+        # Handle 'x' suffix in matrix IDs
+        # Try original ID first
+        if dog1_id in self.distance_matrix and dog2_id in self.distance_matrix[dog1_id]:
+            distance = self.distance_matrix[dog1_id].get(dog2_id, self.EXCLUSION_DISTANCE)
+        # Try adding 'x' suffix
+        elif f"{dog1_id}x" in self.distance_matrix and f"{dog2_id}x" in self.distance_matrix[f"{dog1_id}x"]:
+            distance = self.distance_matrix[f"{dog1_id}x"].get(f"{dog2_id}x", self.EXCLUSION_DISTANCE)
+        # Try if IDs already have 'x' and need to be stripped
+        elif dog1_id.endswith('x') and dog2_id.endswith('x'):
+            base1 = dog1_id[:-1]
+            base2 = dog2_id[:-1]
+            if base1 in self.distance_matrix and base2 in self.distance_matrix[base1]:
+                distance = self.distance_matrix[base1].get(base2, self.EXCLUSION_DISTANCE)
+            else:
+                distance = self.EXCLUSION_DISTANCE
+        else:
+            distance = self.EXCLUSION_DISTANCE
         
         if distance is None or distance < 0:
             return self.EXCLUSION_DISTANCE
