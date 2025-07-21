@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dog Assignment Optimization System with Dynamic Capacity - FIXED
+Dog Assignment Optimization System with Dynamic Capacity - VERBOSE SWAP LOGGING
 CRITICAL FIX: Preserves exact original group assignments (only changes driver names)
 - Default capacity: 8 dogs per group
 - Dense routes (avg < 0.5mi): 12 dogs per group
@@ -215,6 +215,7 @@ class DogReassignmentSystem:
             # Load all dog data
             drivers_found = set()
             self.dog_assignments = []
+            callouts_found = 0
             
             for row_idx, row in enumerate(all_values[1:], 2):
                 if len(row) > max(dog_name_idx, combined_idx, dog_id_idx, callout_idx):
@@ -237,6 +238,10 @@ class DogReassignmentSystem:
                         self.dog_name_to_id[dog_name] = dog_id
                         self.dog_id_to_name[dog_id] = dog_name
                         
+                        # Count callouts needing assignment
+                        if callout and not combined:
+                            callouts_found += 1
+                        
                         # Count driver assignments and find drivers
                         if combined and ':' in combined:
                             driver_name = combined.split(':')[0]
@@ -249,6 +254,7 @@ class DogReassignmentSystem:
             
             print(f"✅ Found {len(drivers_found)} drivers from assignments")
             print(f"✅ Loaded {len(self.dog_assignments)} dog assignments")
+            print(f"✅ Found {callouts_found} callouts needing assignment")
             print(f"✅ Capacity will be calculated dynamically based on route density:")
             print(f"   - Dense routes (avg < {self.DENSE_ROUTE_THRESHOLD}mi): capacity 12")
             print(f"   - Standard routes: capacity 8")
@@ -405,7 +411,7 @@ class DogReassignmentSystem:
                 if callout and not combined:
                     callouts.append(assignment)
         
-        print(f"📋 Found {len(callouts)} dogs needing assignment")
+        print(f"📊 Found {len(callouts)} callout dogs to assign")
         
         # Initialize tracking
         if not hasattr(self, 'optimization_swaps'):
@@ -482,7 +488,7 @@ class DogReassignmentSystem:
                 capacity_info = self.calculate_driver_density(best_driver)
                 capacity = capacity_info['capacity']
                 
-                print(f"✅ {dog_name} → {best_driver} ({best_distance:.2f}mi) "
+                print(f"   ✅ {dog_name} → {best_driver} ({best_distance:.2f}mi) "
                       f"for callout '{original_callout}' [cap {capacity}]")
                 assignments_made += 1
             else:
@@ -492,7 +498,7 @@ class DogReassignmentSystem:
         return assignments_made
 
     def optimize_existing_assignments_with_swaps(self):
-        """Optimize existing assignments by swapping dogs between drivers"""
+        """Optimize existing assignments by swapping dogs between drivers - VERBOSE VERSION"""
         print("\n🔄 Starting swap optimization...")
         
         if not hasattr(self, 'optimization_swaps'):
@@ -512,22 +518,42 @@ class DogReassignmentSystem:
                         driver_assignments[driver].append(assignment)
         
         drivers = list(driver_assignments.keys())
+        print(f"🔍 Testing {len(drivers)} drivers for beneficial swaps...")
         
+        if len(drivers) < 2:
+            print("❌ Need at least 2 drivers to perform swaps")
+            return 0
+        
+        print(f"📊 Current driver assignments:")
+        for driver in drivers:
+            dog_count = len(driver_assignments[driver])
+            capacity_info = self.calculate_driver_density(driver)
+            print(f"   {driver}: {dog_count} dogs (capacity: {capacity_info['capacity']})")
+        
+        swaps_tested = 0
         for i, driver1 in enumerate(drivers):
             for driver2 in drivers[i+1:]:
                 if swap_count >= max_swaps:
+                    print(f"⏹️  Reached maximum swaps limit ({max_swaps})")
                     break
                 
                 dogs1 = driver_assignments[driver1]
                 dogs2 = driver_assignments[driver2]
                 
+                print(f"\n🔍 Testing swaps between {driver1} ({len(dogs1)} dogs) ↔ {driver2} ({len(dogs2)} dogs)")
+                
+                driver_pair_swaps = 0
                 for dog1 in dogs1:
                     for dog2 in dogs2:
                         if swap_count >= max_swaps:
                             break
                         
+                        swaps_tested += 1
+                        
                         # Check if swap would reduce total distance
-                        if self.would_swap_reduce_distance(dog1, dog2, driver1, driver2):
+                        would_improve = self.would_swap_reduce_distance(dog1, dog2, driver1, driver2)
+                        
+                        if would_improve:
                             # Preserve the original group assignments
                             dog1_groups = dog1['combined'].split(':', 1)[1]  # Keep original format
                             dog2_groups = dog2['combined'].split(':', 1)[1]  # Keep original format
@@ -545,11 +571,35 @@ class DogReassignmentSystem:
                                 'new_driver2': driver1
                             })
                             
-                            print(f"🔄 Swapped {dog1['dog_name']} ↔ {dog2['dog_name']} "
-                                  f"({driver1} ↔ {driver2})")
+                            print(f"   🔄 SWAPPED: {dog1['dog_name']} ({driver1}→{driver2}) ↔ {dog2['dog_name']} ({driver2}→{driver1})")
                             swap_count += 1
+                            driver_pair_swaps += 1
+                            
+                            # Update the driver assignments for next iterations
+                            driver_assignments[driver1] = [d for d in driver_assignments[driver1] if d != dog1]
+                            driver_assignments[driver1].append(dog2)
+                            driver_assignments[driver2] = [d for d in driver_assignments[driver2] if d != dog2]
+                            driver_assignments[driver2].append(dog1)
+                        
+                        # Print progress every 100 tests
+                        if swaps_tested % 100 == 0:
+                            print(f"   📊 Progress: {swaps_tested} swaps tested, {swap_count} beneficial swaps found")
+                
+                if driver_pair_swaps == 0:
+                    print(f"   ❌ No beneficial swaps found between {driver1} and {driver2}")
+            
+            if swap_count >= max_swaps:
+                break
         
-        print(f"📊 Optimization complete: {swap_count} swaps made")
+        print(f"\n📊 Swap Optimization Summary:")
+        print(f"   - Total swaps tested: {swaps_tested}")
+        print(f"   - Beneficial swaps found: {swap_count}")
+        print(f"   - Optimization complete: {swap_count} swaps made")
+        
+        if swap_count == 0:
+            print("   ℹ️  No swaps provided sufficient benefit (0.2+ mile savings)")
+            print("   ℹ️  This suggests routes are already well-optimized!")
+        
         return swap_count
 
     def would_swap_reduce_distance(self, dog1, dog2, driver1, driver2):
@@ -831,8 +881,8 @@ def main():
         is_github_actions = os.environ.get('GITHUB_ACTIONS') == 'true'
         
         if is_github_actions:
-            choice = '3'  # Auto-run both analysis and optimization
-            print("🤖 Running in GitHub Actions - performing analysis and optimization")
+            choice = '1'  # Just run optimization in GitHub Actions
+            print("🤖 Running in GitHub Actions - performing optimization")
         else:
             print("\nWhat would you like to do?")
             print("1. Run optimization and reassignments")
@@ -855,6 +905,9 @@ def main():
         system.send_slack_notification(assignments_made, swaps_made)
         
         print(f"\n🎉 Process completed successfully!")
+        print(f"📊 Final Summary:")
+        print(f"   - New assignments: {assignments_made}")
+        print(f"   - Swaps made: {swaps_made}")
         
     except KeyboardInterrupt:
         print(f"\n⏹️  Process interrupted by user")
