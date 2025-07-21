@@ -3,7 +3,7 @@
 Dog Assignment Optimization System with Dynamic Capacity - FULLY UPDATED
 CRITICAL FIXES:
 - Preserves exact original group assignments (only changes driver names)
-- Auto-detects distance matrix format (dog IDs in column A or B)
+- Properly reads distance matrix (Column A = row IDs, Row 1 = column IDs)
 - Prevents duplicate swaps and excessive swapping
 - Better rate limiting for Google Sheets API
 - Debug function for troubleshooting
@@ -89,7 +89,7 @@ class DogReassignmentSystem:
             raise
 
     def load_distance_matrix(self):
-        """Load distance matrix from Google Sheets with PROPER format"""
+        """Load distance matrix from Google Sheets - FIXED FORMAT"""
         try:
             spreadsheet = self.gc.open_by_key(self.DISTANCE_MATRIX_SHEET_ID)
             try:
@@ -105,51 +105,65 @@ class DogReassignmentSystem:
                 print("❌ Distance matrix sheet is empty")
                 return
             
-            # Get COLUMN dog IDs from first row (B1, C1, D1, etc.)
-            column_dog_ids = [val.strip() for val in all_values[0][1:] if val.strip()]
-            print(f"📋 Found {len(column_dog_ids)} dog IDs in header row")
-            print(f"   Sample column IDs: {column_dog_ids[:5]}...")
+            # FIXED FORMAT: 
+            # - Row 1 has headers: A1="Dog ID", B1="1x", C1="2x", etc.
+            # - Column A has row dog IDs: A2="1x", A3="2x", etc.
+            # - Distances start at B2
             
-            # Get ROW dog IDs from column A (A2, A3, A4, etc.)
-            row_dog_ids = []
-            for row in all_values[1:]:  # Skip header row
-                if len(row) > 0 and row[0].strip():
-                    row_dog_ids.append(row[0].strip())
+            # Get column headers from row 1, starting at B1
+            column_headers = all_values[0]  # Full first row
+            column_dog_ids = []
+            for i in range(1, len(column_headers)):  # Start from index 1 (column B)
+                if column_headers[i].strip():
+                    column_dog_ids.append(column_headers[i].strip())
             
-            print(f"📋 Found {len(row_dog_ids)} dog IDs in column A")
-            print(f"   Sample row IDs: {row_dog_ids[:5]}...")
+            print(f"📋 Column headers (B1 onwards): {column_dog_ids[:5]}...")
+            print(f"   Total column dogs: {len(column_dog_ids)}")
             
             # Build distance matrix
             distances_loaded = 0
-            for row_idx, row in enumerate(all_values[1:]):  # Skip header row
-                if len(row) > 0 and row[0].strip():
-                    from_dog = row[0].strip()  # Dog ID from column A
+            
+            # Process each row starting from row 2 (index 1)
+            for row_index in range(1, len(all_values)):
+                row = all_values[row_index]
+                
+                # Get the dog ID from column A
+                if len(row) == 0 or not row[0].strip():
+                    continue
                     
-                    # Distances start from column B (index 1)
-                    for col_idx, distance_str in enumerate(row[1:]):
-                        if col_idx < len(column_dog_ids) and distance_str.strip():
-                            to_dog = column_dog_ids[col_idx]  # Dog ID from header row
-                            try:
-                                distance = float(distance_str)
-                                if from_dog not in self.distance_matrix:
-                                    self.distance_matrix[from_dog] = {}
-                                self.distance_matrix[from_dog][to_dog] = distance
-                                distances_loaded += 1
-                            except (ValueError, TypeError):
-                                pass
+                from_dog_id = row[0].strip()  # Column A value
+                
+                # Get distances starting from column B (index 1)
+                for col_index in range(1, min(len(row), len(column_dog_ids) + 1)):
+                    if row[col_index].strip():
+                        to_dog_id = column_dog_ids[col_index - 1]  # -1 because column_dog_ids is 0-indexed
+                        
+                        try:
+                            distance = float(row[col_index].strip())
+                            
+                            # Initialize dict if needed
+                            if from_dog_id not in self.distance_matrix:
+                                self.distance_matrix[from_dog_id] = {}
+                            
+                            self.distance_matrix[from_dog_id][to_dog_id] = distance
+                            distances_loaded += 1
+                            
+                        except ValueError:
+                            pass  # Skip non-numeric values
             
-            print(f"✅ Loaded distance matrix with {len(row_dog_ids)} x {len(column_dog_ids)} dogs")
-            print(f"✅ Loaded {distances_loaded} distance values")
+            print(f"✅ Loaded {distances_loaded} distances")
+            print(f"✅ Matrix has {len(self.distance_matrix)} dogs with distance data")
             
-            # Verify it's working
+            # Verify with a sample
             if self.distance_matrix:
-                sample_from = list(self.distance_matrix.keys())[0]
-                sample_to = list(self.distance_matrix[sample_from].keys())[0]
-                sample_dist = self.distance_matrix[sample_from][sample_to]
-                print(f"✅ Sample distance: {sample_from} → {sample_to} = {sample_dist}mi")
+                sample_dog = list(self.distance_matrix.keys())[0]
+                sample_distances = list(self.distance_matrix[sample_dog].items())[:3]
+                print(f"✅ Sample: {sample_dog} → {sample_distances}")
                 
         except Exception as e:
             print(f"❌ Error loading distance matrix: {e}")
+            import traceback
+            traceback.print_exc()
             self.distance_matrix = {}
 
     def load_dog_coordinates(self):
@@ -997,7 +1011,7 @@ class DogReassignmentSystem:
                     
                     if distance <= 3:
                         count_by_range['0-3mi'] += 1
-                    elif distance == 100:
+                    elif abs(distance - 100) < 0.001:
                         count_by_range['100mi'] += 1
                     else:
                         count_by_range['other'] += 1
@@ -1070,4 +1084,29 @@ def main():
         
         if choice in ['1', '3']:
             assignments_made = system.reassign_dogs_closest_first_strategy()
-            swaps_made = system.optimize_exis
+            swaps_made = system.optimize_existing_assignments_with_swaps()
+            system.write_results_to_sheets()
+        
+        if choice == '4':
+            system.debug_distance_issues()
+            return  # Exit after debug, don't continue with other operations
+        
+        system.report_haversine_usage()
+        system.send_slack_notification(assignments_made, swaps_made)
+        
+        print(f"\n🎉 Process completed successfully!")
+        print(f"📊 Final Summary:")
+        print(f"   - New assignments: {assignments_made}")
+        print(f"   - Swaps made: {swaps_made}")
+        
+    except KeyboardInterrupt:
+        print(f"\n⏹️  Process interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
