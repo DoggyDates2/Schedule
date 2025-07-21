@@ -36,7 +36,8 @@ class DogReassignmentSystem:
         self.MAP_SHEET_ID = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
         self.DISTANCE_MATRIX_SHEET_ID = "1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg"
         self.MAP_TAB = "Map"
-        self.MATRIX_TAB = "Sheet1"
+        self.MATRIX_TAB = "Matrix"  # Try these if Matrix doesn't work:
+        # Common possibilities: "Sheet1", "Distance Matrix", "Distances", "Matrix", or check the tab finder script
         
         # System parameters (MUST BE BEFORE LOADING DATA)
         self.PREFERRED_DISTANCE = 0.2
@@ -85,13 +86,37 @@ class DogReassignmentSystem:
     def load_distance_matrix(self):
         """Load distance matrix from Google Sheets"""
         try:
-            sheet = self.gc.open_by_key(self.DISTANCE_MATRIX_SHEET_ID).worksheet(self.MATRIX_TAB)
+            # Try by tab name first, then by sheet ID as fallback
+            spreadsheet = self.gc.open_by_key(self.DISTANCE_MATRIX_SHEET_ID)
+            try:
+                sheet = spreadsheet.worksheet(self.MATRIX_TAB)
+                print(f"✅ Found sheet by name: '{self.MATRIX_TAB}'")
+            except gspread.WorksheetNotFound:
+                # Try by sheet ID (from your URL: gid=398422902)
+                sheet = spreadsheet.get_worksheet_by_id(398422902)
+                print(f"✅ Found sheet by ID: 398422902")
+                if sheet:
+                    print(f"✅ Sheet title is actually: '{sheet.title}'")
+            
             all_values = sheet.get_all_values()
+            
+            if not all_values:
+                print("❌ Distance matrix sheet is empty")
+                return
             
             # Get dog IDs from the first row (headers)
             dog_ids = [val for val in all_values[0][1:] if val.strip()]
+            print(f"🔍 Found {len(dog_ids)} dog IDs in first row")
+            
+            if len(dog_ids) == 0:
+                print("❌ No dog IDs found in distance matrix headers")
+                return
+            
+            # Show sample IDs for verification
+            print(f"📋 Sample dog IDs: {dog_ids[:5]}...")
             
             # Build distance matrix
+            distances_loaded = 0
             for i, row in enumerate(all_values[1:], 1):
                 if i <= len(dog_ids):
                     from_dog = dog_ids[i-1]
@@ -103,10 +128,12 @@ class DogReassignmentSystem:
                                 if from_dog not in self.distance_matrix:
                                     self.distance_matrix[from_dog] = {}
                                 self.distance_matrix[from_dog][to_dog] = distance
+                                distances_loaded += 1
                             except (ValueError, TypeError):
                                 pass
             
             print(f"✅ Loaded distance matrix with {len(dog_ids)} dogs")
+            print(f"✅ Loaded {distances_loaded} distance values")
             if dog_ids:
                 sample_id = dog_ids[0]
                 if sample_id.endswith('x'):
@@ -114,6 +141,9 @@ class DogReassignmentSystem:
                     
         except Exception as e:
             print(f"❌ Error loading distance matrix: {e}")
+            print(f"   Sheet ID: {self.DISTANCE_MATRIX_SHEET_ID}")
+            print(f"   Tab name: {self.MATRIX_TAB}")
+            print("   💡 Try running the sheet tab finder script to verify tab names")
             self.distance_matrix = {}
 
     def load_dog_coordinates(self):
@@ -671,12 +701,13 @@ class DogReassignmentSystem:
                         })
             
             if updates:
-                # Batch update for efficiency
-                for i in range(0, len(updates), 100):
-                    batch = updates[i:i+100]
+                # Batch update for efficiency with better rate limiting
+                for i in range(0, len(updates), 50):  # Smaller batches
+                    batch = updates[i:i+50]
                     for update in batch:
-                        sheet.update(update['range'], update['values'])
-                    time.sleep(1)  # Rate limiting
+                        sheet.update(update['values'], update['range'])
+                    time.sleep(2)  # Longer delay to avoid rate limits
+                    print(f"📊 Updated batch {i//50 + 1}/{(len(updates)-1)//50 + 1}")
                 
                 print(f"✅ Updated {len(updates)} assignments in Google Sheets")
             else:
