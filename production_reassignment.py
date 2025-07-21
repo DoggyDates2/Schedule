@@ -112,16 +112,27 @@ class DogReassignmentSystem:
             # Get dog IDs from the first row - check if they start from column A or B
             first_row = all_values[0]
             
-            # Check if dog IDs start from column A (index 0) or column B (index 1)
-            if first_row[0].strip() and (first_row[0].endswith('x') or first_row[0].isdigit()):
+            print(f"🔍 Checking first row format:")
+            print(f"   A1: '{first_row[0] if len(first_row) > 0 else 'EMPTY'}'")
+            print(f"   B1: '{first_row[1] if len(first_row) > 1 else 'EMPTY'}'")
+            print(f"   C1: '{first_row[2] if len(first_row) > 2 else 'EMPTY'}'")
+            
+            # More robust detection - check if A1 looks like a dog ID
+            a1_is_dog_id = (len(first_row) > 0 and 
+                           first_row[0].strip() and 
+                           (first_row[0].strip().endswith('x') or 
+                            first_row[0].strip().isdigit() or
+                            any(char.isdigit() for char in first_row[0].strip())))
+            
+            if a1_is_dog_id:
                 # Dog IDs start from column A
-                dog_ids = [val for val in first_row if val.strip()]
-                print(f"🔍 Dog IDs start from column A")
+                dog_ids = [val.strip() for val in first_row if val.strip()]
+                print(f"🔍 Dog IDs start from column A (detected: A1='{first_row[0].strip()}')")
                 col_offset = 0
             else:
                 # Dog IDs start from column B (traditional format)
-                dog_ids = [val for val in first_row[1:] if val.strip()]
-                print(f"🔍 Dog IDs start from column B")
+                dog_ids = [val.strip() for val in first_row[1:] if val.strip()]
+                print(f"🔍 Dog IDs start from column B (A1 doesn't look like dog ID)")
                 col_offset = 1
             
             print(f"🔍 Found {len(dog_ids)} dog IDs in first row")
