@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Dog Assignment Optimization System with Distance Analysis and Haversine Fallback
-Complete production script with all features
-Matrix Sheet: 1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg
-Map Sheet: 1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U
+Dog Assignment Optimization System - FIXED WITH CORRECT COLUMN MAPPINGS
+Based on column explanation document:
+- Drivers are in column R (index 17), not column A
+- Groups come from Callout column K (index 10)
+- Capacities are in columns U, V, W (indices 20, 21, 22)
 """
 
 import os
@@ -29,17 +30,17 @@ logger = logging.getLogger(__name__)
 
 
 class DogReassignmentSystem:
-    """Enhanced dog reassignment system with distance analysis and fallback"""
+    """Enhanced dog reassignment system with correct column mappings"""
     
     def __init__(self):
         """Initialize the dog reassignment system"""
-        print("🚀 Enhanced Dog Reassignment System - WITH DISTANCE ANALYSIS")
+        print("🚀 Enhanced Dog Reassignment System - FIXED COLUMN MAPPINGS")
         
         # Google Sheets IDs
         self.MATRIX_SHEET_ID = "1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg"
         self.MAP_SHEET_ID = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
-        self.MATRIX_TAB = "Matrix"  # Update if your tab name is different
-        self.MAP_TAB = "Map"        # Update if your tab name is different
+        self.MATRIX_TAB = "Matrix"
+        self.MAP_TAB = "Map"
         
         # Initialize Google Sheets connection
         self.setup_google_sheets()
@@ -68,7 +69,7 @@ class DogReassignmentSystem:
         self.EXCLUSION_DISTANCE = 200.0
         
         # Swap optimization parameters
-        self.SWAP_THRESHOLD = 0.2  # Swap if saves 0.2+ miles
+        self.SWAP_THRESHOLD = 0.2
         
         # Tracking variables
         self.active_drivers = set()
@@ -116,7 +117,6 @@ class DogReassignmentSystem:
             if not credentials_json:
                 raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable not set")
             
-            # Try to parse JSON
             try:
                 credentials_data = json.loads(credentials_json)
             except json.JSONDecodeError as e:
@@ -179,7 +179,7 @@ class DogReassignmentSystem:
             raise
 
     def load_dog_assignments(self):
-        """Load dog assignments from Google Sheets"""
+        """Load dog assignments from Google Sheets - WITH CORRECT COLUMN MAPPINGS"""
         try:
             sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
             all_values = sheet.get_all_values()
@@ -189,28 +189,37 @@ class DogReassignmentSystem:
             headers = all_values[0] if all_values else []
             self.headers = headers  # Store for coordinate loading
             
-            # Column mapping
-            dog_name_idx = next((i for i, h in enumerate(headers) if "Dog Name" in h), 1)
-            combined_idx = next((i for i, h in enumerate(headers) if "Combined Assignment" in h), 7)
-            group_idx = next((i for i, h in enumerate(headers) if h == "Group"), 8)
-            dog_id_idx = next((i for i, h in enumerate(headers) if "Dog ID" in h), 9)
-            callout_idx = next((i for i, h in enumerate(headers) if "Callout" in h), 10)
-            num_dogs_idx = next((i for i, h in enumerate(headers) if "Number of Dogs" in h), 5)
-            driver_idx = 0  # Driver is typically first column
+            # CORRECT Column mapping based on your explanation:
+            # A=0: Address
+            # B=1: Dog Name  
+            # C=2: District
+            # D=3: Latitude
+            # E=4: Longitude
+            # F=5: Number of dogs
+            # G=6: Name (ignore)
+            # H=7: Combined Assignment
+            # I=8: Group (ignore)
+            # J=9: Dog ID
+            # K=10: Callout (groups needed)
+            # R=17: Driver
+            # U=20: Group 1 capacity
+            # V=21: Group 2 capacity
+            # W=22: Group 3 capacity
             
-            # Find capacity columns
-            capacity_indices = {}
-            for i, header in enumerate(headers):
-                if "Group1Cap" in header or "group1" in header.lower():
-                    capacity_indices[1] = i
-                elif "Group2Cap" in header or "group2" in header.lower():
-                    capacity_indices[2] = i
-                elif "Group3Cap" in header or "group3" in header.lower():
-                    capacity_indices[3] = i
+            address_idx = 0        # Column A
+            dog_name_idx = 1       # Column B
+            combined_idx = 7       # Column H
+            dog_id_idx = 9         # Column J
+            callout_idx = 10       # Column K - THIS IS WHERE GROUPS ARE!
+            num_dogs_idx = 5       # Column F
+            driver_idx = 17        # Column R - THIS IS WHERE DRIVERS ARE!
             
-            # If not found, default to columns R, S, T (17, 18, 19)
-            if not capacity_indices:
-                capacity_indices = {1: 17, 2: 18, 3: 19}
+            # Capacity columns - U, V, W
+            capacity_indices = {
+                1: 20,  # Column U
+                2: 21,  # Column V
+                3: 22   # Column W
+            }
             
             # Initialize tracking
             self.dog_assignments = []
@@ -218,49 +227,86 @@ class DogReassignmentSystem:
             self.driver_assignment_counts = defaultdict(int)
             self.all_capacity_rows = []
             
-            # Parse each row
+            print(f"📊 Parsing assignments with correct column mappings...")
+            print(f"   Drivers in column R (index {driver_idx})")
+            print(f"   Groups in Callout column K (index {callout_idx})")
+            print(f"   Capacities in columns U,V,W (indices 20,21,22)")
+            
+            # First, collect all driver info from the driver section (starting at column R)
+            drivers_found = set()
+            for row in all_values[1:]:
+                if len(row) > driver_idx and row[driver_idx] and row[driver_idx].strip():
+                    driver_name = row[driver_idx].strip()
+                    drivers_found.add(driver_name)
+                    
+                    # Parse capacities
+                    capacities = {}
+                    total_capacity = 0
+                    
+                    for group_num, col_idx in capacity_indices.items():
+                        if col_idx < len(row) and row[col_idx] and row[col_idx].strip():
+                            try:
+                                cap = int(row[col_idx])
+                                capacities[f'group{group_num}'] = cap
+                                total_capacity += cap
+                            except ValueError:
+                                capacities[f'group{group_num}'] = 8  # Default
+                                total_capacity += 8
+                        else:
+                            capacities[f'group{group_num}'] = 8  # Default
+                            total_capacity += 8
+                    
+                    self.driver_capacities[driver_name] = capacities
+                    self.driver_capacities[driver_name]['total'] = total_capacity
+            
+            print(f"✅ Found {len(drivers_found)} drivers in driver list")
+            
+            # Now parse dog assignments
             for i, row in enumerate(all_values[1:], start=2):
                 if len(row) <= dog_name_idx:
                     continue
-                
-                # Store for capacity parsing
-                if len(row) > driver_idx and row[driver_idx]:
-                    self.all_capacity_rows.append(row)
                 
                 # Parse dog assignment
                 dog_name = row[dog_name_idx] if dog_name_idx < len(row) else ""
                 if not dog_name or dog_name.strip() == "":
                     continue
                 
-                # Parse combined assignment to extract groups
+                # Get combined assignment
                 combined = row[combined_idx] if combined_idx < len(row) else ""
-                needed_groups = []
                 
-                if combined and ':' in combined:
-                    driver_part, groups_part = combined.split(':', 1)
-                    # Parse various group formats
-                    groups_str = groups_part.replace('&', '').replace(',', '').replace(' ', '')
+                # Get callout (this is where groups are specified!)
+                callout = row[callout_idx] if callout_idx < len(row) else ""
+                
+                # Parse groups from callout field
+                needed_groups = []
+                if callout and callout.strip():
+                    # Callout format is like ":1", ":2", ":123", ":1&2", etc.
+                    callout_str = callout.strip()
+                    if callout_str.startswith(':'):
+                        callout_str = callout_str[1:]  # Remove leading colon
                     
                     # Extract numeric groups
-                    for char in groups_str:
+                    for char in callout_str:
                         if char.isdigit() and char in ['1', '2', '3']:
                             group_num = int(char)
                             if group_num not in needed_groups:
                                 needed_groups.append(group_num)
-                    
-                    # Count assignment for driver
+                
+                # Count assignment for driver if has combined assignment
+                if combined and ':' in combined:
+                    driver_part = combined.split(':', 1)[0]
                     if driver_part:
                         self.driver_assignment_counts[driver_part] += 1
                 
                 assignment = {
                     'dog_name': dog_name.strip(),
-                    'combined': combined,
-                    'group': row[group_idx] if group_idx < len(row) else "",
                     'dog_id': row[dog_id_idx].strip() if dog_id_idx < len(row) else "",
-                    'callout': row[callout_idx] if callout_idx < len(row) else "",
-                    'row_number': i,
+                    'combined': combined,
+                    'callout': callout,
                     'needed_groups': sorted(needed_groups),
-                    'number_of_dogs': row[num_dogs_idx] if num_dogs_idx < len(row) else "1"
+                    'row_number': i,
+                    'number_of_dogs': row[num_dogs_idx] if num_dogs_idx < len(row) else "1",
+                    'address': row[address_idx] if address_idx < len(row) else ""
                 }
                 
                 self.dog_assignments.append(assignment)
@@ -270,65 +316,31 @@ class DogReassignmentSystem:
                     self.dog_name_to_id[assignment['dog_name']] = assignment['dog_id']
                     self.dog_id_to_name[assignment['dog_id']] = assignment['dog_name']
             
-            # Parse driver capacities with defaults
-            for row in self.all_capacity_rows:
-                driver_name = row[driver_idx] if driver_idx < len(row) else ""
-                if driver_name:
-                    try:
-                        capacities = {}
-                        total_capacity = 0
-                        has_any_capacity = False
-                        
-                        for group_num, col_idx in capacity_indices.items():
-                            if col_idx < len(row) and row[col_idx] and row[col_idx].strip():
-                                try:
-                                    cap = int(row[col_idx])
-                                    capacities[f'group{group_num}'] = cap
-                                    total_capacity += cap
-                                    has_any_capacity = True
-                                except ValueError:
-                                    capacities[f'group{group_num}'] = 8  # Default if can't parse
-                                    total_capacity += 8
-                            else:
-                                capacities[f'group{group_num}'] = 8  # Default if empty
-                                total_capacity += 8
-                        
-                        # Always add driver if they have a name
-                        if not has_any_capacity:
-                            print(f"   ℹ️ Using default capacity (8 per group) for {driver_name}")
-                        
-                        self.driver_capacities[driver_name] = capacities
-                        self.driver_capacities[driver_name]['total'] = total_capacity
-                                    
-                    except Exception as e:
-                        print(f"   Warning: Error parsing {driver_name}, using defaults: {e}")
-                        # Use default capacities
-                        self.driver_capacities[driver_name] = {
-                            'group1': 8,
-                            'group2': 8,
-                            'group3': 8,
-                            'total': 24
-                        }
-            
-            # Identify active drivers
+            # Identify active drivers (those with current assignments)
             self.active_drivers = {
                 driver for driver, count in self.driver_assignment_counts.items() 
                 if count > 0 and driver in self.driver_capacities
             }
             
-            # Filter capacities to only active drivers
-            active_capacities = {}
-            for driver, capacity in self.driver_capacities.items():
-                if driver in self.active_drivers:
-                    active_capacities[driver] = capacity
-            self.driver_capacities = active_capacities
-            
             print(f"✅ Loaded {len(self.dog_assignments)} dog assignments")
             print(f"✅ Found {len(self.active_drivers)} active drivers (with assignments)")
             
-            # Count callouts
-            callout_count = sum(1 for d in self.dog_assignments if d.get('callout', '').strip())
+            # Count callouts (dogs with groups specified in callout field but no assignment)
+            callout_count = sum(1 for d in self.dog_assignments 
+                               if d.get('needed_groups') and
+                               not d.get('combined', '').strip())
             print(f"✅ Found {callout_count} callouts needing assignment")
+            
+            # Debug: Show some sample callouts
+            print("\n📋 Sample callouts:")
+            sample_count = 0
+            for d in self.dog_assignments:
+                if (d.get('needed_groups') and 
+                    not d.get('combined', '').strip()):
+                    print(f"   - {d['dog_name']}: needs groups {d['needed_groups']} (callout: {d['callout']})")
+                    sample_count += 1
+                    if sample_count >= 5:
+                        break
             
             # Run data integrity check
             self.validate_data_integrity()
@@ -344,7 +356,7 @@ class DogReassignmentSystem:
         # Columns D and E are Latitude and Longitude
         lat_idx = 3  # Column D (0-based index)
         lng_idx = 4  # Column E (0-based index)
-        dog_id_idx = next((i for i, h in enumerate(self.headers) if "Dog ID" in h), 9)
+        dog_id_idx = 9  # Column J
         
         self.dog_coordinates = {}
         
@@ -445,21 +457,9 @@ class DogReassignmentSystem:
             return float('inf')
 
     def parse_dog_groups(self, assignment):
-        """Safely parse groups from assignment"""
-        combined = assignment.get('combined', '')
-        groups = []
-        
-        if ':' in combined:
-            groups_str = combined.split(':', 1)[1]
-            # Handle various formats
-            groups_str = groups_str.replace(',', '').replace(' ', '').replace('&', '')
-            groups = [int(g) for g in groups_str if g.isdigit() and g in ['1', '2', '3']]
-        
-        # Fallback to needed_groups if available
-        if not groups and 'needed_groups' in assignment:
-            groups = assignment.get('needed_groups', [])
-        
-        return groups
+        """Parse groups from assignment - they're in needed_groups already"""
+        # Groups are already parsed in load_dog_assignments
+        return assignment.get('needed_groups', [])
 
     def get_driver_current_dogs(self, driver):
         """Get current dogs assigned to a driver"""
@@ -721,13 +721,14 @@ class DogReassignmentSystem:
         
         # Report on data coverage
         total_dogs = len(assignment_dogs)
-        in_matrix = len(assignment_dogs & matrix_dogs)
-        have_coords = len([d for d in assignment_dogs if d in self.dog_coordinates])
-        
-        print(f"\n📊 Distance Data Coverage:")
-        print(f"   Total dogs: {total_dogs}")
-        print(f"   In distance matrix: {in_matrix} ({in_matrix/total_dogs*100:.1f}%)")
-        print(f"   Have coordinates: {have_coords} ({have_coords/total_dogs*100:.1f}%)")
+        if total_dogs > 0:
+            in_matrix = len(assignment_dogs & matrix_dogs)
+            have_coords = len([d for d in assignment_dogs if d in self.dog_coordinates])
+            
+            print(f"\n📊 Distance Data Coverage:")
+            print(f"   Total dogs: {total_dogs}")
+            print(f"   In distance matrix: {in_matrix} ({in_matrix/total_dogs*100:.1f}%)")
+            print(f"   Have coordinates: {have_coords} ({have_coords/total_dogs*100:.1f}%)")
         
         return len(issues) == 0
 
@@ -933,27 +934,44 @@ class DogReassignmentSystem:
         return swaps_made
 
     def reassign_dogs_closest_first_strategy(self):
-        """Assign all callouts to closest driver, then fix capacity violations"""
+        """Assign all callouts to closest driver - FIXED VERSION"""
         print("\n🎯 Starting CLOSEST-FIRST assignment strategy")
         
         # Build current state
         current_assignments = self.build_initial_assignments_state()
         
-        # Get callout dogs (not blank = needs assignment)
-        callout_dogs = [d for d in self.dog_assignments if d.get('callout', '').strip() != '']
+        # Get callout dogs - FIXED LOGIC
+        # A dog needs assignment if:
+        # 1. Has groups specified in needed_groups
+        # 2. Has no current assignment (combined is blank)
+        callout_dogs = []
+        for d in self.dog_assignments:
+            if (d.get('needed_groups') and  # Has groups specified
+                not d.get('combined', '').strip()):  # But no assignment
+                callout_dogs.append(d)
+        
         print(f"📊 Found {len(callout_dogs)} callout dogs to assign")
+        
+        # Debug: Show first few callouts
+        if callout_dogs:
+            print("\n📋 Dogs needing assignment:")
+            for dog in callout_dogs[:5]:
+                print(f"   - {dog['dog_name']} (ID: {dog['dog_id']}) needs groups: {dog['needed_groups']}")
+            if len(callout_dogs) > 5:
+                print(f"   ... and {len(callout_dogs) - 5} more")
         
         assignments_made = []
         
-        # Phase 1: Assign to closest driver (ignore capacity)
+        # Phase 1: Assign to closest driver
         print("\n📍 Phase 1: Assigning to closest drivers...")
+        
         for dog in callout_dogs:
             dog_id = dog['dog_id']
             dog_name = dog['dog_name']
             groups = dog.get('needed_groups', [])
             
             if not groups:
-                print(f"   ⚠️ {dog_name} has no groups specified")
+                print(f"   ⚠️ {dog_name} has no groups specified (shouldn't happen)")
                 continue
             
             # Find compatible drivers
@@ -972,9 +990,15 @@ class DogReassignmentSystem:
                 driver_dogs = [a['dog_id'] for a in current_assignments if a['driver'] == driver]
                 
                 if not driver_dogs:
+                    # If driver has no dogs yet, use a default distance
+                    # or skip this driver
                     continue
                 
-                min_distance = min(self.safe_get_distance(dog_id, other_dog) for other_dog in driver_dogs)
+                min_distance = float('inf')
+                for other_dog in driver_dogs:
+                    dist = self.safe_get_distance(dog_id, other_dog)
+                    if dist < min_distance:
+                        min_distance = dist
                 
                 if min_distance < best_distance:
                     best_distance = min_distance
@@ -982,10 +1006,12 @@ class DogReassignmentSystem:
             
             if best_driver:
                 # Make assignment
+                groups_str = ''.join(map(str, sorted(groups)))
+                
                 assignment = {
                     'dog_id': dog_id,
                     'dog_name': dog_name,
-                    'new_assignment': f"{best_driver}:{''.join(map(str, groups))}",
+                    'new_assignment': f"{best_driver}:{groups_str}",
                     'driver': best_driver,
                     'distance': best_distance,
                     'quality': 'GOOD' if best_distance < 0.2 else 'BACKUP' if best_distance < 0.5 else 'EMERGENCY',
@@ -1007,7 +1033,9 @@ class DogReassignmentSystem:
                     'groups': groups
                 })
                 
-                print(f"   ✅ {dog_name} → {best_driver} ({best_distance:.2f}mi)")
+                print(f"   ✅ {dog_name} → {best_driver} ({best_distance:.2f}mi) for groups {groups}")
+            else:
+                print(f"   ❌ Could not find suitable driver for {dog_name} (groups: {groups})")
         
         # Phase 2: Check and fix capacity violations
         print("\n🔧 Phase 2: Checking capacity violations...")
@@ -1046,7 +1074,7 @@ class DogReassignmentSystem:
         return assignments_made
 
     def write_results_to_sheets(self, reassignments):
-        """Write results back to Google Sheets"""
+        """Write results back to Google Sheets - FIXED to write to column H"""
         try:
             print("\n📝 Writing results to Google Sheets...")
             
@@ -1056,9 +1084,9 @@ class DogReassignmentSystem:
             all_values = sheet.get_all_values()
             headers = all_values[0] if all_values else []
             
-            # Find column indices
-            dog_id_idx = next((i for i, h in enumerate(headers) if "Dog ID" in h), 9)
-            combined_idx = next((i for i, h in enumerate(headers) if "Combined Assignment" in h), 7)
+            # Column indices
+            dog_id_idx = 9        # Column J
+            combined_idx = 7      # Column H - Combined Assignment
             
             # Process reassignments
             batch_updates = []
@@ -1082,7 +1110,7 @@ class DogReassignmentSystem:
                 for i, row in enumerate(all_values[1:], start=2):
                     if len(row) > dog_id_idx and row[dog_id_idx] == dog_id:
                         batch_updates.append({
-                            'range': f'{chr(65 + combined_idx)}{i}',  # Convert column index to letter
+                            'range': f'{chr(65 + combined_idx)}{i}',  # Column H
                             'values': [[new_assignment]]
                         })
                         rows_updated += 1
@@ -1100,7 +1128,7 @@ class DogReassignmentSystem:
                     
                     sheet.batch_update(batch_updates)
                     self.last_sheet_update = time.time()
-                    print(f"✅ Successfully updated {rows_updated} assignments")
+                    print(f"✅ Successfully updated {rows_updated} assignments in column H")
                 except Exception as e:
                     print(f"❌ Batch update failed: {e}")
                     raise
@@ -1166,15 +1194,21 @@ def main():
         # Initialize system
         system = DogReassignmentSystem()
         
-        # Ask user what they want to do
-        print("\n" + "="*60)
-        print("What would you like to do?")
-        print("1. Run optimization and reassignments")
-        print("2. Analyze within-group distances only")
-        print("3. Both (analyze first, then optimize)")
-        print("="*60)
-        
-        choice = input("Enter choice (1/2/3): ").strip()
+        # Check if running in GitHub Actions
+        if os.environ.get('GITHUB_ACTIONS'):
+            # Auto-run optimization in GitHub Actions
+            print("\n🤖 Running in GitHub Actions - auto-selecting optimization")
+            choice = '1'
+        else:
+            # Ask user what they want to do
+            print("\n" + "="*60)
+            print("What would you like to do?")
+            print("1. Run optimization and reassignments")
+            print("2. Analyze within-group distances only")
+            print("3. Both (analyze first, then optimize)")
+            print("="*60)
+            
+            choice = input("Enter choice (1/2/3): ").strip()
         
         if choice in ['2', '3']:
             # Run distance analysis
