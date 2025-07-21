@@ -56,12 +56,7 @@ class DogReassignmentSystem:
         self.all_capacity_rows = []
         self.dog_coordinates = {}
         
-        # Load data from sheets
-        self.load_distance_matrix()
-        self.load_dog_assignments()
-        self.load_dog_coordinates()
-        
-        # System parameters
+        # System parameters (MUST BE BEFORE LOADING DATA)
         self.PREFERRED_DISTANCE = 0.2
         self.MAX_DISTANCE = 0.5
         self.ABSOLUTE_MAX_DISTANCE = 1.5
@@ -69,6 +64,11 @@ class DogReassignmentSystem:
         self.ADJACENT_GROUP_DISTANCE = 0.1
         self.EXCLUSION_DISTANCE = 200.0
         self.DENSE_ROUTE_THRESHOLD = 0.5  # Routes with avg < 0.5mi are dense
+        
+        # Load data from sheets
+        self.load_distance_matrix()
+        self.load_dog_assignments()
+        self.load_dog_coordinates()
         
         # Swap optimization parameters
         self.SWAP_THRESHOLD = 0.2
