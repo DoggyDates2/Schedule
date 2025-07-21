@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Dog Assignment Optimization System with Dynamic Capacity - VERBOSE SWAP LOGGING
-CRITICAL FIX: Preserves exact original group assignments (only changes driver names)
+Dog Assignment Optimization System with Dynamic Capacity - FULLY UPDATED
+CRITICAL FIXES:
+- Preserves exact original group assignments (only changes driver names)
+- Auto-detects distance matrix format (dog IDs in column A or B)
+- Prevents duplicate swaps and excessive swapping
+- Better rate limiting for Google Sheets API
+- Debug function for troubleshooting
+
 - Default capacity: 8 dogs per group
 - Dense routes (avg < 0.5mi): 12 dogs per group
 - Automatic capacity adjustment based on route density
@@ -36,8 +42,7 @@ class DogReassignmentSystem:
         self.MAP_SHEET_ID = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
         self.DISTANCE_MATRIX_SHEET_ID = "1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg"
         self.MAP_TAB = "Map"
-        self.MATRIX_TAB = "Matrix"  # Try these if Matrix doesn't work:
-        # Common possibilities: "Sheet1", "Distance Matrix", "Distances", "Matrix", or check the tab finder script
+        self.MATRIX_TAB = "Matrix"
         
         # System parameters (MUST BE BEFORE LOADING DATA)
         self.PREFERRED_DISTANCE = 0.2
@@ -84,7 +89,7 @@ class DogReassignmentSystem:
             raise
 
     def load_distance_matrix(self):
-        """Load distance matrix from Google Sheets"""
+        """Load distance matrix from Google Sheets with auto-detection of format"""
         try:
             # Try by tab name first, then by sheet ID as fallback
             spreadsheet = self.gc.open_by_key(self.DISTANCE_MATRIX_SHEET_ID)
@@ -104,8 +109,21 @@ class DogReassignmentSystem:
                 print("❌ Distance matrix sheet is empty")
                 return
             
-            # Get dog IDs from the first row (headers)
-            dog_ids = [val for val in all_values[0][1:] if val.strip()]
+            # Get dog IDs from the first row - check if they start from column A or B
+            first_row = all_values[0]
+            
+            # Check if dog IDs start from column A (index 0) or column B (index 1)
+            if first_row[0].strip() and (first_row[0].endswith('x') or first_row[0].isdigit()):
+                # Dog IDs start from column A
+                dog_ids = [val for val in first_row if val.strip()]
+                print(f"🔍 Dog IDs start from column A")
+                col_offset = 0
+            else:
+                # Dog IDs start from column B (traditional format)
+                dog_ids = [val for val in first_row[1:] if val.strip()]
+                print(f"🔍 Dog IDs start from column B")
+                col_offset = 1
+            
             print(f"🔍 Found {len(dog_ids)} dog IDs in first row")
             
             if len(dog_ids) == 0:
@@ -120,7 +138,7 @@ class DogReassignmentSystem:
             for i, row in enumerate(all_values[1:], 1):
                 if i <= len(dog_ids):
                     from_dog = dog_ids[i-1]
-                    for j, distance_str in enumerate(row[1:], 0):
+                    for j, distance_str in enumerate(row[col_offset:], 0):
                         if j < len(dog_ids) and distance_str.strip():
                             to_dog = dog_ids[j]
                             try:
@@ -143,7 +161,7 @@ class DogReassignmentSystem:
             print(f"❌ Error loading distance matrix: {e}")
             print(f"   Sheet ID: {self.DISTANCE_MATRIX_SHEET_ID}")
             print(f"   Tab name: {self.MATRIX_TAB}")
-            print("   💡 Try running the sheet tab finder script to verify tab names")
+            print("   💡 Try running the debug function (option 4) to verify setup")
             self.distance_matrix = {}
 
     def load_dog_coordinates(self):
@@ -528,7 +546,7 @@ class DogReassignmentSystem:
         return assignments_made
 
     def optimize_existing_assignments_with_swaps(self):
-        """Optimize existing assignments by swapping dogs between drivers - VERBOSE VERSION"""
+        """Optimize existing assignments by swapping dogs between drivers - IMPROVED VERSION"""
         print("\n🔄 Starting swap optimization...")
         
         if not hasattr(self, 'optimization_swaps'):
@@ -1043,15 +1061,19 @@ def main():
         # Check if running in GitHub Actions
         is_github_actions = os.environ.get('GITHUB_ACTIONS') == 'true'
         
+        # Always show menu (even in GitHub Actions for debugging)
+        print("\nWhat would you like to do?")
+        print("1. Run optimization and reassignments")
+        print("2. Analyze within-group distances only")
+        print("3. Both (analyze first, then optimize)")
+        print("4. Debug distance matrix issues")
+        
         if is_github_actions:
-            choice = '1'  # Just run optimization in GitHub Actions
-            print("🤖 Running in GitHub Actions - performing optimization")
+            print("🤖 Running in GitHub Actions - auto-selecting option 1 (override with manual input)")
+            choice = input("Enter choice (1/2/3/4) or press Enter for default: ").strip()
+            if not choice:  # If they just press Enter
+                choice = '1'
         else:
-            print("\nWhat would you like to do?")
-            print("1. Run optimization and reassignments")
-            print("2. Analyze within-group distances only")
-            print("3. Both (analyze first, then optimize)")
-            print("4. Debug distance matrix issues")
             choice = input("Enter choice (1/2/3/4): ").strip()
         
         assignments_made = 0
