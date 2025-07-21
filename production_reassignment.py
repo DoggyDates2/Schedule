@@ -1061,19 +1061,17 @@ def main():
         # Check if running in GitHub Actions
         is_github_actions = os.environ.get('GITHUB_ACTIONS') == 'true'
         
-        # Always show menu (even in GitHub Actions for debugging)
-        print("\nWhat would you like to do?")
-        print("1. Run optimization and reassignments")
-        print("2. Analyze within-group distances only")
-        print("3. Both (analyze first, then optimize)")
-        print("4. Debug distance matrix issues")
-        
+        # Handle GitHub Actions vs interactive mode
         if is_github_actions:
-            print("🤖 Running in GitHub Actions - auto-selecting option 1 (override with manual input)")
-            choice = input("Enter choice (1/2/3/4) or press Enter for default: ").strip()
-            if not choice:  # If they just press Enter
-                choice = '1'
+            choice = '1'  # Auto-run optimization in GitHub Actions
+            print("🤖 Running in GitHub Actions - auto-selecting option 1 (optimization)")
         else:
+            # Interactive mode - show menu
+            print("\nWhat would you like to do?")
+            print("1. Run optimization and reassignments")
+            print("2. Analyze within-group distances only")
+            print("3. Both (analyze first, then optimize)")
+            print("4. Debug distance matrix issues")
             choice = input("Enter choice (1/2/3/4): ").strip()
         
         assignments_made = 0
