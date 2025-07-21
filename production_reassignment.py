@@ -535,7 +535,8 @@ class DogReassignmentSystem:
             self.optimization_swaps = []
         
         swap_count = 0
-        max_swaps = 50
+        max_swaps = 20  # Reduced to prevent excessive swapping
+        swapped_pairs = set()  # Track swapped pairs to prevent duplicates
         
         # Get all current assignments
         driver_assignments = defaultdict(list)
@@ -573,10 +574,15 @@ class DogReassignmentSystem:
                 print(f"\n🔍 Testing swaps between {driver1} ({len(dogs1)} dogs) ↔ {driver2} ({len(dogs2)} dogs)")
                 
                 driver_pair_swaps = 0
-                for dog1 in dogs1:
-                    for dog2 in dogs2:
+                for dog1 in dogs1[:]:  # Use slice to avoid modification during iteration
+                    for dog2 in dogs2[:]:
                         if swap_count >= max_swaps:
                             break
+                        
+                        # Create unique pair identifier to prevent duplicate swaps
+                        pair_id = tuple(sorted([dog1['dog_id'], dog2['dog_id']]))
+                        if pair_id in swapped_pairs:
+                            continue
                         
                         swaps_tested += 1
                         
@@ -584,6 +590,9 @@ class DogReassignmentSystem:
                         would_improve = self.would_swap_reduce_distance(dog1, dog2, driver1, driver2)
                         
                         if would_improve:
+                            # Mark this pair as swapped
+                            swapped_pairs.add(pair_id)
+                            
                             # Preserve the original group assignments
                             dog1_groups = dog1['combined'].split(':', 1)[1]  # Keep original format
                             dog2_groups = dog2['combined'].split(':', 1)[1]  # Keep original format
@@ -702,12 +711,13 @@ class DogReassignmentSystem:
             
             if updates:
                 # Batch update for efficiency with better rate limiting
-                for i in range(0, len(updates), 50):  # Smaller batches
-                    batch = updates[i:i+50]
+                for i in range(0, len(updates), 25):  # Even smaller batches
+                    batch = updates[i:i+25]
                     for update in batch:
                         sheet.update(update['values'], update['range'])
-                    time.sleep(2)  # Longer delay to avoid rate limits
-                    print(f"📊 Updated batch {i//50 + 1}/{(len(updates)-1)//50 + 1}")
+                        time.sleep(0.5)  # Small delay between each update
+                    time.sleep(3)  # Longer delay between batches
+                    print(f"📊 Updated batch {i//25 + 1}/{(len(updates)-1)//25 + 1}")
                 
                 print(f"✅ Updated {len(updates)} assignments in Google Sheets")
             else:
@@ -896,6 +906,128 @@ class DogReassignmentSystem:
         else:
             print("\n📊 No group statistics available")
 
+    def debug_distance_issues(self):
+        """Debug distance matrix issues and ID mismatches"""
+        try:
+            print("\n🔍 DEBUGGING DISTANCE MATRIX ISSUES")
+            print("=" * 40)
+            
+            # Get distance matrix dog IDs
+            matrix_dog_ids = set(self.distance_matrix.keys())
+            print(f"📊 Distance Matrix Info:")
+            print(f"   Total dog IDs: {len(matrix_dog_ids)}")
+            print(f"   Sample IDs: {list(matrix_dog_ids)[:10]}")
+            
+            # Get assignment sheet dog IDs
+            assignment_dog_ids = set()
+            callout_dog_ids = set()
+            
+            for assignment in self.dog_assignments:
+                if isinstance(assignment, dict):
+                    dog_id = assignment.get('dog_id', '').strip()
+                    if dog_id:
+                        assignment_dog_ids.add(dog_id)
+                        # Check if this dog has a callout
+                        callout = assignment.get('callout', '').strip()
+                        combined = assignment.get('combined', '').strip()
+                        if callout and not combined:  # Has callout but no assignment
+                            callout_dog_ids.add(dog_id)
+            
+            print(f"\n📊 Assignment Sheet Info:")
+            print(f"   Total dog IDs: {len(assignment_dog_ids)}")
+            print(f"   Callout dog IDs: {len(callout_dog_ids)}")
+            print(f"   Sample IDs: {list(assignment_dog_ids)[:10]}")
+            
+            # Find mismatches
+            missing_from_matrix = assignment_dog_ids - matrix_dog_ids
+            missing_from_assignments = matrix_dog_ids - assignment_dog_ids
+            callouts_missing_from_matrix = callout_dog_ids - matrix_dog_ids
+            
+            print(f"\n🔍 ID MISMATCH ANALYSIS:")
+            print(f"   Dogs in assignments but NOT in matrix: {len(missing_from_matrix)}")
+            print(f"   Dogs in matrix but NOT in assignments: {len(missing_from_assignments)}")
+            print(f"   Callout dogs missing from matrix: {len(callouts_missing_from_matrix)}")
+            
+            if missing_from_matrix:
+                print(f"\n❌ MISSING FROM MATRIX (first 10):")
+                for dog_id in list(missing_from_matrix)[:10]:
+                    print(f"   - {dog_id}")
+            
+            if callouts_missing_from_matrix:
+                print(f"\n🚨 CALLOUT DOGS MISSING FROM MATRIX (first 10):")
+                for dog_id in list(callouts_missing_from_matrix)[:10]:
+                    print(f"   - {dog_id}")
+            
+            # Check the specific dogs that got extreme distances
+            extreme_assignment_dogs = [
+                ('4x', 'Binky', '67.43mi'),
+                ('1695x', 'Bauer', '86.10mi'), 
+                ('55x', 'Ollie', 'should be close'),
+                ('56x', 'Jagger', 'should be close')
+            ]
+            
+            print(f"\n🔍 CHECKING SPECIFIC PROBLEM DOGS:")
+            for dog_id, dog_name, note in extreme_assignment_dogs:
+                in_matrix = dog_id in matrix_dog_ids
+                in_assignments = dog_id in assignment_dog_ids
+                print(f"   {dog_name} ({dog_id}): Matrix={in_matrix}, Assignments={in_assignments} - {note}")
+                
+                if not in_matrix:
+                    print(f"     ❌ {dog_name} NOT FOUND in distance matrix - will use haversine!")
+            
+            # Your matrix rule: ≤3mi = actual, >3mi = 100mi
+            print(f"\n🎯 MATRIX VALIDATION (should be ≤3mi or =100mi):")
+            sample_distances = []
+            count_by_range = {'0-3mi': 0, '100mi': 0, 'other': 0}
+            
+            # Sample some distances from the matrix
+            for i, (from_dog, to_dict) in enumerate(self.distance_matrix.items()):
+                if i >= 5:  # Just check first 5 dogs
+                    break
+                for j, (to_dog, distance) in enumerate(to_dict.items()):
+                    if j >= 5:  # Just check first 5 distances per dog
+                        break
+                    sample_distances.append((from_dog, to_dog, distance))
+                    
+                    if distance <= 3:
+                        count_by_range['0-3mi'] += 1
+                    elif distance == 100:
+                        count_by_range['100mi'] += 1
+                    else:
+                        count_by_range['other'] += 1
+            
+            print(f"   Sample distances from matrix:")
+            for from_dog, to_dog, dist in sample_distances[:10]:
+                print(f"     {from_dog} → {to_dog}: {dist}mi")
+            
+            print(f"   Distance distribution in matrix:")
+            print(f"     0-3 miles: {count_by_range['0-3mi']}")
+            print(f"     100 miles: {count_by_range['100mi']}")
+            print(f"     Other (unexpected): {count_by_range['other']}")
+            
+            if count_by_range['other'] > 0:
+                print(f"     ⚠️  Found unexpected distances (should only be ≤3 or =100)")
+            
+            print(f"\n💡 KEY INSIGHT:")
+            print(f"   If callout dogs show 60-80mi distances, they're NOT in your matrix!")
+            print(f"   Your matrix: ≤3mi (real) or 100mi (distant)")
+            print(f"   Haversine fallback: 60-80mi (real straight-line)")
+            print(f"   → Distances like 67mi prove haversine is being used")
+            
+            print(f"\n💡 RECOMMENDATIONS:")
+            if len(callouts_missing_from_matrix) > 0:
+                print(f"   1. ❗ {len(callouts_missing_from_matrix)} callout dogs are missing from distance matrix")
+                print(f"      These will use haversine fallback (less accurate)")
+            
+            if len(missing_from_matrix) > len(callouts_missing_from_matrix):
+                print(f"   2. ❗ Many assigned dogs also missing from matrix")
+                print(f"      This could explain why haversine is used so much")
+                
+        except Exception as e:
+            print(f"❌ Error in debug: {e}")
+            import traceback
+            traceback.print_exc()
+
     def report_haversine_usage(self):
         """Report on haversine fallback usage"""
         if hasattr(self, 'haversine_fallback_count') and self.haversine_fallback_count > 0:
@@ -919,7 +1051,8 @@ def main():
             print("1. Run optimization and reassignments")
             print("2. Analyze within-group distances only")
             print("3. Both (analyze first, then optimize)")
-            choice = input("Enter choice (1/2/3): ").strip()
+            print("4. Debug distance matrix issues")
+            choice = input("Enter choice (1/2/3/4): ").strip()
         
         assignments_made = 0
         swaps_made = 0
@@ -931,6 +1064,10 @@ def main():
             assignments_made = system.reassign_dogs_closest_first_strategy()
             swaps_made = system.optimize_existing_assignments_with_swaps()
             system.write_results_to_sheets()
+        
+        if choice == '4':
+            system.debug_distance_issues()
+            return  # Exit after debug, don't continue with other operations
         
         system.report_haversine_usage()
         system.send_slack_notification(assignments_made, swaps_made)
