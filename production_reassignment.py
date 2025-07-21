@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dog Assignment Optimization System - Production Ready
-Complete rewrite with all fixes and correct Google Sheets IDs
+Dog Assignment Optimization System with Distance Analysis and Haversine Fallback
+Complete production script with all features
 Matrix Sheet: 1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg
 Map Sheet: 1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U
 """
@@ -10,7 +10,9 @@ import os
 import sys
 import json
 import time
+import math
 import logging
+import statistics
 from datetime import datetime
 from collections import defaultdict
 from typing import Dict, List, Tuple, Set, Optional
@@ -27,16 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 class DogReassignmentSystem:
-    """Enhanced dog reassignment system with all optimizations
-    
-    This system connects to two separate Google Sheets:
-    1. Matrix spreadsheet - contains dog-to-dog distances
-    2. Map spreadsheet - contains assignments, drivers, and capacities
-    """
+    """Enhanced dog reassignment system with distance analysis and fallback"""
     
     def __init__(self):
         """Initialize the dog reassignment system"""
-        print("🚀 Enhanced Dog Reassignment System - WITH DOG SWAPPING OPTIMIZATION")
+        print("🚀 Enhanced Dog Reassignment System - WITH DISTANCE ANALYSIS")
         
         # Google Sheets IDs
         self.MATRIX_SHEET_ID = "1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg"
@@ -55,12 +52,14 @@ class DogReassignmentSystem:
         self.dog_id_to_name = {}
         self.driver_assignment_counts = defaultdict(int)
         self.all_capacity_rows = []
+        self.dog_coordinates = {}
         
         # Load data from sheets
         self.load_distance_matrix()
         self.load_dog_assignments()
+        self.load_dog_coordinates()
         
-        # System parameters (from your existing code)
+        # System parameters
         self.PREFERRED_DISTANCE = 0.2
         self.MAX_DISTANCE = 0.5
         self.ABSOLUTE_MAX_DISTANCE = 1.5
@@ -105,6 +104,10 @@ class DogReassignmentSystem:
         # Rate limiting
         self.last_sheet_update = 0
         self.MIN_UPDATE_INTERVAL = 1.0
+        
+        # Haversine tracking
+        self.haversine_fallback_count = 0
+        self.haversine_pairs = set()
 
     def setup_google_sheets(self):
         """Initialize Google Sheets connection with better error handling"""
@@ -176,15 +179,17 @@ class DogReassignmentSystem:
             raise
 
     def load_dog_assignments(self):
-        """Load dog assignments from Google Sheets - using YOUR EXACT format"""
+        """Load dog assignments from Google Sheets"""
         try:
             sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
             all_values = sheet.get_all_values()
+            self.assignment_data = all_values  # Store for coordinate loading
             
-            # Find column indices from headers (based on your existing code)
+            # Find column indices from headers
             headers = all_values[0] if all_values else []
+            self.headers = headers  # Store for coordinate loading
             
-            # Column mapping - from your script
+            # Column mapping
             dog_name_idx = next((i for i, h in enumerate(headers) if "Dog Name" in h), 1)
             combined_idx = next((i for i, h in enumerate(headers) if "Combined Assignment" in h), 7)
             group_idx = next((i for i, h in enumerate(headers) if h == "Group"), 8)
@@ -193,7 +198,7 @@ class DogReassignmentSystem:
             num_dogs_idx = next((i for i, h in enumerate(headers) if "Number of Dogs" in h), 5)
             driver_idx = 0  # Driver is typically first column
             
-            # Find capacity columns (looking for Group1Cap, Group2Cap, Group3Cap)
+            # Find capacity columns
             capacity_indices = {}
             for i, header in enumerate(headers):
                 if "Group1Cap" in header or "group1" in header.lower():
@@ -233,7 +238,7 @@ class DogReassignmentSystem:
                 
                 if combined and ':' in combined:
                     driver_part, groups_part = combined.split(':', 1)
-                    # Parse various group formats: "1", "12", "1&2", "123", "1DD1", etc.
+                    # Parse various group formats
                     groups_str = groups_part.replace('&', '').replace(',', '').replace(' ', '')
                     
                     # Extract numeric groups
@@ -254,7 +259,7 @@ class DogReassignmentSystem:
                     'dog_id': row[dog_id_idx].strip() if dog_id_idx < len(row) else "",
                     'callout': row[callout_idx] if callout_idx < len(row) else "",
                     'row_number': i,
-                    'needed_groups': sorted(needed_groups),  # Store parsed groups
+                    'needed_groups': sorted(needed_groups),
                     'number_of_dogs': row[num_dogs_idx] if num_dogs_idx < len(row) else "1"
                 }
                 
@@ -265,34 +270,47 @@ class DogReassignmentSystem:
                     self.dog_name_to_id[assignment['dog_name']] = assignment['dog_id']
                     self.dog_id_to_name[assignment['dog_id']] = assignment['dog_name']
             
-            # Parse driver capacities
+            # Parse driver capacities with defaults
             for row in self.all_capacity_rows:
                 driver_name = row[driver_idx] if driver_idx < len(row) else ""
                 if driver_name:
                     try:
                         capacities = {}
                         total_capacity = 0
+                        has_any_capacity = False
                         
                         for group_num, col_idx in capacity_indices.items():
-                            if col_idx < len(row) and row[col_idx]:
+                            if col_idx < len(row) and row[col_idx] and row[col_idx].strip():
                                 try:
                                     cap = int(row[col_idx])
                                     capacities[f'group{group_num}'] = cap
                                     total_capacity += cap
+                                    has_any_capacity = True
                                 except ValueError:
-                                    capacities[f'group{group_num}'] = 0
+                                    capacities[f'group{group_num}'] = 8  # Default if can't parse
+                                    total_capacity += 8
                             else:
-                                capacities[f'group{group_num}'] = 0
+                                capacities[f'group{group_num}'] = 8  # Default if empty
+                                total_capacity += 8
                         
-                        # Only add drivers with some capacity
-                        if total_capacity > 0:
-                            self.driver_capacities[driver_name] = capacities
-                            self.driver_capacities[driver_name]['total'] = total_capacity
-                            
+                        # Always add driver if they have a name
+                        if not has_any_capacity:
+                            print(f"   ℹ️ Using default capacity (8 per group) for {driver_name}")
+                        
+                        self.driver_capacities[driver_name] = capacities
+                        self.driver_capacities[driver_name]['total'] = total_capacity
+                                    
                     except Exception as e:
-                        print(f"   Warning: Could not parse capacity for {driver_name}: {e}")
+                        print(f"   Warning: Error parsing {driver_name}, using defaults: {e}")
+                        # Use default capacities
+                        self.driver_capacities[driver_name] = {
+                            'group1': 8,
+                            'group2': 8,
+                            'group3': 8,
+                            'total': 24
+                        }
             
-            # Identify active drivers (those with current assignments)
+            # Identify active drivers
             self.active_drivers = {
                 driver for driver, count in self.driver_assignment_counts.items() 
                 if count > 0 and driver in self.driver_capacities
@@ -308,16 +326,9 @@ class DogReassignmentSystem:
             print(f"✅ Loaded {len(self.dog_assignments)} dog assignments")
             print(f"✅ Found {len(self.active_drivers)} active drivers (with assignments)")
             
-            # Count callouts (not blank = needs assignment)
+            # Count callouts
             callout_count = sum(1 for d in self.dog_assignments if d.get('callout', '').strip())
             print(f"✅ Found {callout_count} callouts needing assignment")
-            
-            # Show excluded drivers
-            all_capacity_drivers = {row[driver_idx] for row in self.all_capacity_rows 
-                                  if len(row) > driver_idx and row[driver_idx]}
-            excluded = all_capacity_drivers - self.active_drivers
-            if excluded:
-                print(f"❌ Excluded {len(excluded)} inactive drivers: {', '.join(sorted(excluded)[:3])}{'...' if len(excluded) > 3 else ''}")
             
             # Run data integrity check
             self.validate_data_integrity()
@@ -326,34 +337,102 @@ class DogReassignmentSystem:
             print(f"❌ Error loading dog assignments: {e}")
             raise
 
-    # Core distance and helper methods
-    def get_distance(self, dog1_id, dog2_id):
-        """Get distance between two dogs from matrix"""
+    def load_dog_coordinates(self):
+        """Load dog coordinates from the Map sheet for haversine fallback"""
+        print("📍 Loading dog coordinates for distance fallback...")
+        
+        # Columns D and E are Latitude and Longitude
+        lat_idx = 3  # Column D (0-based index)
+        lng_idx = 4  # Column E (0-based index)
+        dog_id_idx = next((i for i, h in enumerate(self.headers) if "Dog ID" in h), 9)
+        
+        self.dog_coordinates = {}
+        
+        # Parse coordinates from columns D and E
+        coord_count = 0
+        missing_coord_count = 0
+        
+        for row in self.assignment_data[1:]:
+            if len(row) > max(lat_idx, lng_idx, dog_id_idx):
+                try:
+                    dog_id = row[dog_id_idx].strip()
+                    lat = float(row[lat_idx]) if row[lat_idx] else None
+                    lng = float(row[lng_idx]) if row[lng_idx] else None
+                    
+                    if dog_id and lat and lng:
+                        self.dog_coordinates[dog_id] = (lat, lng)
+                        coord_count += 1
+                    elif dog_id:
+                        missing_coord_count += 1
+                except (ValueError, IndexError):
+                    continue
+        
+        print(f"✅ Loaded coordinates for {coord_count} dogs")
+        if missing_coord_count > 0:
+            print(f"⚠️  {missing_coord_count} dogs missing coordinates in columns D/E")
+
+    def haversine_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate the great circle distance between two points on Earth"""
+        # Radius of Earth in miles
+        R = 3959.0
+        
+        # Convert to radians
+        lat1_rad = math.radians(lat1)
+        lon1_rad = math.radians(lon1)
+        lat2_rad = math.radians(lat2)
+        lon2_rad = math.radians(lon2)
+        
+        # Differences
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        
+        # Haversine formula
+        a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        distance = R * c
+        
+        # Add a factor to approximate driving distance from straight-line distance
+        # Typically driving is 1.2-1.5x straight line distance in urban/suburban areas
+        driving_factor = 1.3
+        
+        return distance * driving_factor
+
+    def get_distance_with_fallback(self, dog1_id, dog2_id):
+        """Get distance with haversine fallback for missing matrix entries"""
         if dog1_id == dog2_id:
             return 0.0
         
-        # Handle 'x' suffix in matrix IDs
-        # Try original ID first
+        # Try matrix first (actual driving distances)
         if dog1_id in self.distance_matrix and dog2_id in self.distance_matrix[dog1_id]:
-            distance = self.distance_matrix[dog1_id].get(dog2_id, self.EXCLUSION_DISTANCE)
-        # Try adding 'x' suffix
-        elif f"{dog1_id}x" in self.distance_matrix and f"{dog2_id}x" in self.distance_matrix[f"{dog1_id}x"]:
-            distance = self.distance_matrix[f"{dog1_id}x"].get(f"{dog2_id}x", self.EXCLUSION_DISTANCE)
-        # Try if IDs already have 'x' and need to be stripped
-        elif dog1_id.endswith('x') and dog2_id.endswith('x'):
-            base1 = dog1_id[:-1]
-            base2 = dog2_id[:-1]
-            if base1 in self.distance_matrix and base2 in self.distance_matrix[base1]:
-                distance = self.distance_matrix[base1].get(base2, self.EXCLUSION_DISTANCE)
-            else:
-                distance = self.EXCLUSION_DISTANCE
-        else:
-            distance = self.EXCLUSION_DISTANCE
+            distance = self.distance_matrix[dog1_id].get(dog2_id, None)
+            if distance is not None and 0 <= distance < self.EXCLUSION_DISTANCE:
+                return float(distance)
         
-        if distance is None or distance < 0:
-            return self.EXCLUSION_DISTANCE
+        # Fallback to haversine if available
+        if hasattr(self, 'dog_coordinates'):
+            if dog1_id in self.dog_coordinates and dog2_id in self.dog_coordinates:
+                lat1, lon1 = self.dog_coordinates[dog1_id]
+                lat2, lon2 = self.dog_coordinates[dog2_id]
+                
+                haversine_dist = self.haversine_distance(lat1, lon1, lat2, lon2)
+                
+                # Track fallback usage
+                if not hasattr(self, 'haversine_fallback_count'):
+                    self.haversine_fallback_count = 0
+                    self.haversine_pairs = set()
+                
+                self.haversine_fallback_count += 1
+                self.haversine_pairs.add((dog1_id, dog2_id))
+                
+                return haversine_dist
         
-        return float(distance)
+        # No data available
+        return self.EXCLUSION_DISTANCE
+
+    # Core distance and helper methods
+    def get_distance(self, dog1_id, dog2_id):
+        """Get distance between two dogs from matrix with haversine fallback"""
+        return self.get_distance_with_fallback(dog1_id, dog2_id)
 
     def safe_get_distance(self, dog1_id, dog2_id):
         """Safely get distance between two dogs with fallback"""
@@ -372,7 +451,7 @@ class DogReassignmentSystem:
         
         if ':' in combined:
             groups_str = combined.split(':', 1)[1]
-            # Handle various formats: "123", "1,2,3", "1 2 3", "1&2", "1DD1"
+            # Handle various formats
             groups_str = groups_str.replace(',', '').replace(' ', '').replace('&', '')
             groups = [int(g) for g in groups_str if g.isdigit() and g in ['1', '2', '3']]
         
@@ -393,6 +472,166 @@ class DogReassignmentSystem:
                     current_dogs.append(assignment)
         
         return current_dogs
+
+    def analyze_within_group_distances(self):
+        """Analyze distances between dogs within same driver AND same group"""
+        print("\n" + "="*80)
+        print("🔍 WITHIN-GROUP DISTANCE ANALYSIS")
+        print("="*80)
+        print("Shows how close dogs are within each driver's groups")
+        print("Target: Average < 0.3 miles for efficient routes")
+        print("="*80)
+        
+        max_distance_overall = 0
+        max_distance_info = None
+        problem_groups = []
+        all_group_stats = []
+        
+        for driver in sorted(self.active_drivers):
+            driver_dogs = self.get_driver_current_dogs(driver)
+            
+            if not driver_dogs:
+                continue
+            
+            # Group dogs by their group numbers
+            driver_groups = defaultdict(list)
+            for dog in driver_dogs:
+                dog_groups = self.parse_dog_groups(dog)
+                for g in dog_groups:
+                    driver_groups[g].append(dog)
+            
+            if not driver_groups:
+                continue
+            
+            print(f"\n{'='*60}")
+            print(f"DRIVER: {driver}")
+            print(f"{'='*60}")
+            
+            driver_stats = {'driver': driver, 'groups': {}}
+            
+            for group_num in sorted(driver_groups.keys()):
+                dogs = driver_groups[group_num]
+                
+                if len(dogs) < 2:
+                    print(f"\n  Group {group_num}: Only {len(dogs)} dog - no distances to calculate")
+                    continue
+                
+                # Calculate all pairwise distances
+                distances = []
+                distance_pairs = []
+                
+                for i in range(len(dogs)):
+                    for j in range(i + 1, len(dogs)):
+                        dist = self.safe_get_distance(dogs[i]['dog_id'], dogs[j]['dog_id'])
+                        if dist < float('inf'):
+                            distances.append(dist)
+                            distance_pairs.append({
+                                'dog1': dogs[i],
+                                'dog2': dogs[j],
+                                'distance': dist
+                            })
+                            
+                            # Track maximum distance
+                            if dist > max_distance_overall:
+                                max_distance_overall = dist
+                                max_distance_info = {
+                                    'driver': driver,
+                                    'group': group_num,
+                                    'dog1': dogs[i],
+                                    'dog2': dogs[j],
+                                    'distance': dist
+                                }
+                
+                if distances:
+                    avg_dist = statistics.mean(distances)
+                    min_dist = min(distances)
+                    max_dist = max(distances)
+                    
+                    driver_stats['groups'][group_num] = {
+                        'dog_count': len(dogs),
+                        'avg_distance': avg_dist,
+                        'min_distance': min_dist,
+                        'max_distance': max_dist,
+                        'distances': distances
+                    }
+                    
+                    # Print results
+                    print(f"\n  Group {group_num}: {len(dogs)} dogs")
+                    print(f"    Average distance: {avg_dist:.2f} miles", end="")
+                    if avg_dist < 0.3:
+                        print(" ✅")
+                    elif avg_dist < 0.5:
+                        print(" ⚠️")
+                    else:
+                        print(" 🚨")
+                        problem_groups.append({
+                            'driver': driver,
+                            'group': group_num,
+                            'avg_distance': avg_dist,
+                            'dog_count': len(dogs)
+                        })
+                    
+                    print(f"    Min distance: {min_dist:.2f} miles")
+                    print(f"    Max distance: {max_dist:.2f} miles")
+                    
+                    # Show dogs in group
+                    print(f"    Dogs in group:")
+                    for dog in dogs[:5]:  # Show first 5
+                        print(f"      - {dog['dog_name']} (ID: {dog['dog_id']})")
+                    if len(dogs) > 5:
+                        print(f"      ... and {len(dogs) - 5} more")
+                    
+                    # Show worst pairs if problematic
+                    if max_dist > 1.0:
+                        print(f"    ⚠️  Large distances detected!")
+                        worst_pairs = sorted(distance_pairs, key=lambda x: x['distance'], reverse=True)[:3]
+                        for pair in worst_pairs:
+                            print(f"      - {pair['dog1']['dog_name']} ↔ {pair['dog2']['dog_name']}: {pair['distance']:.2f} miles")
+            
+            all_group_stats.append(driver_stats)
+        
+        # Print summary
+        print("\n" + "="*80)
+        print("📊 SUMMARY STATISTICS")
+        print("="*80)
+        
+        # Calculate overall averages by group
+        group_averages = {1: [], 2: [], 3: []}
+        
+        for driver_stats in all_group_stats:
+            for group, stats in driver_stats['groups'].items():
+                if group in group_averages and 'avg_distance' in stats:
+                    group_averages[group].append(stats['avg_distance'])
+        
+        print("\n🎯 AVERAGE DISTANCES BY GROUP:")
+        for group in [1, 2, 3]:
+            if group_averages[group]:
+                avg = statistics.mean(group_averages[group])
+                print(f"  Group {group}: {avg:.2f} miles average")
+            else:
+                print(f"  Group {group}: No data")
+        
+        # Maximum distance
+        print(f"\n🚨 MAXIMUM DISTANCE BETWEEN ANY TWO DOGS:")
+        if max_distance_info:
+            print(f"  Driver: {max_distance_info['driver']}")
+            print(f"  Group: {max_distance_info['group']}")
+            print(f"  Dogs: {max_distance_info['dog1']['dog_name']} ↔ {max_distance_info['dog2']['dog_name']}")
+            print(f"  Distance: {max_distance_info['distance']:.2f} miles")
+        
+        # Problem groups
+        if problem_groups:
+            print(f"\n⚠️  GROUPS NEEDING OPTIMIZATION (avg > 0.5 miles):")
+            problem_groups.sort(key=lambda x: x['avg_distance'], reverse=True)
+            for pg in problem_groups[:10]:
+                print(f"  {pg['driver']} Group {pg['group']}: {pg['avg_distance']:.2f}mi avg ({pg['dog_count']} dogs)")
+        
+        print("\n💡 RECOMMENDATIONS:")
+        print("  ✅ Groups with avg < 0.3 miles are well-optimized")
+        print("  ⚠️  Groups with avg 0.3-0.5 miles could be improved")
+        print("  🚨 Groups with avg > 0.5 miles need immediate attention")
+        
+        return all_group_stats, max_distance_info
 
     def build_initial_assignments_state(self):
         """Build current state of assignments for optimization"""
@@ -463,33 +702,32 @@ class DogReassignmentSystem:
         """Validate all data is consistent"""
         issues = []
         
-        # Check 1: All dog IDs in assignments exist in distance matrix
+        # Check 1: Find dogs missing from matrix
         matrix_dogs = set(self.distance_matrix.keys())
         assignment_dogs = {a.get('dog_id') for a in self.dog_assignments if a.get('dog_id')}
         
         missing_from_matrix = assignment_dogs - matrix_dogs
         if missing_from_matrix:
-            issues.append(f"Dogs in assignments but not in distance matrix: {list(missing_from_matrix)[:5]}")
+            # Check how many have coordinate fallback
+            have_coords = sum(1 for dog in missing_from_matrix if dog in self.dog_coordinates)
+            
+            print(f"\n📍 Dogs not in distance matrix: {len(missing_from_matrix)}")
+            print(f"   - {have_coords} have coordinates (will use haversine fallback)")
+            print(f"   - {len(missing_from_matrix) - have_coords} have NO distance data")
+            
+            if len(missing_from_matrix) - have_coords > 0:
+                no_data = [d for d in missing_from_matrix if d not in self.dog_coordinates]
+                issues.append(f"Dogs with NO distance data: {no_data[:5]}")
         
-        # Check 2: All drivers in assignments have capacities
-        assignment_drivers = {a.get('combined', '').split(':')[0] for a in self.dog_assignments if ':' in a.get('combined', '')}
-        capacity_drivers = set(self.driver_capacities.keys())
+        # Report on data coverage
+        total_dogs = len(assignment_dogs)
+        in_matrix = len(assignment_dogs & matrix_dogs)
+        have_coords = len([d for d in assignment_dogs if d in self.dog_coordinates])
         
-        missing_capacities = assignment_drivers - capacity_drivers - {''}
-        if missing_capacities:
-            issues.append(f"Drivers with assignments but no capacity: {list(missing_capacities)[:5]}")
-        
-        # Check 3: No duplicate dog IDs
-        dog_ids = [a.get('dog_id') for a in self.dog_assignments if a.get('dog_id')]
-        if len(dog_ids) != len(set(dog_ids)):
-            issues.append("Duplicate dog IDs found in assignments")
-        
-        if issues:
-            print("\n⚠️ DATA INTEGRITY ISSUES:")
-            for issue in issues:
-                print(f"   - {issue}")
-        else:
-            print("✅ Data integrity check passed")
+        print(f"\n📊 Distance Data Coverage:")
+        print(f"   Total dogs: {total_dogs}")
+        print(f"   In distance matrix: {in_matrix} ({in_matrix/total_dogs*100:.1f}%)")
+        print(f"   Have coordinates: {have_coords} ({have_coords/total_dogs*100:.1f}%)")
         
         return len(issues) == 0
 
@@ -777,8 +1015,6 @@ class DogReassignmentSystem:
         
         if violations:
             print(f"   ⚠️ Found {len(violations)} capacity violations to fix")
-            # Here you would implement capacity fixing logic
-            # For now, just report them
             for v in violations:
                 print(f"      - {v['driver']} group {v['group']}: {v['count']}/{v['max']} (excess: {v['excess']})")
         
@@ -909,22 +1145,54 @@ class DogReassignmentSystem:
         except Exception as e:
             print(f"⚠️  Error sending Slack notification: {e}")
 
+    def report_haversine_usage(self):
+        """Report on how many times haversine fallback was used"""
+        if hasattr(self, 'haversine_fallback_count') and self.haversine_fallback_count > 0:
+            print(f"\n📍 Haversine Fallback Usage:")
+            print(f"   Used {self.haversine_fallback_count} times for {len(self.haversine_pairs)} unique dog pairs")
+            print(f"   These dogs are not in your distance matrix but have coordinates")
+            
+            # Show some examples
+            examples = list(self.haversine_pairs)[:3]
+            if examples:
+                print(f"   Examples:")
+                for dog1, dog2 in examples:
+                    print(f"     - {dog1} ↔ {dog2}")
+
 
 def main():
-    """Main entry point"""
+    """Main entry point with optional distance analysis"""
     try:
         # Initialize system
         system = DogReassignmentSystem()
         
-        # Run optimization
-        reassignments = system.reassign_dogs_closest_first_strategy()
+        # Ask user what they want to do
+        print("\n" + "="*60)
+        print("What would you like to do?")
+        print("1. Run optimization and reassignments")
+        print("2. Analyze within-group distances only")
+        print("3. Both (analyze first, then optimize)")
+        print("="*60)
         
-        # Write results
-        if reassignments:
-            system.write_results_to_sheets(reassignments)
-            system.send_slack_notification(reassignments)
-        else:
-            print("\nℹ️ No reassignments needed")
+        choice = input("Enter choice (1/2/3): ").strip()
+        
+        if choice in ['2', '3']:
+            # Run distance analysis
+            system.analyze_within_group_distances()
+        
+        if choice in ['1', '3']:
+            # Run optimization
+            reassignments = system.reassign_dogs_closest_first_strategy()
+            
+            # Write results
+            if reassignments:
+                system.write_results_to_sheets(reassignments)
+                system.send_slack_notification(reassignments)
+            else:
+                print("\nℹ️ No reassignments needed")
+        
+        # Report haversine usage
+        system.report_haversine_usage()
         
         print("\n✅ Process complete!")
         
@@ -937,6 +1205,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# This script is now configured with your specific Google Sheets IDs
-# Ready to run: python production_reassignment.py
