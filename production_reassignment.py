@@ -89,19 +89,15 @@ class DogReassignmentSystem:
             raise
 
     def load_distance_matrix(self):
-        """Load distance matrix from Google Sheets with auto-detection of format"""
+        """Load distance matrix from Google Sheets with PROPER format"""
         try:
-            # Try by tab name first, then by sheet ID as fallback
             spreadsheet = self.gc.open_by_key(self.DISTANCE_MATRIX_SHEET_ID)
             try:
                 sheet = spreadsheet.worksheet(self.MATRIX_TAB)
                 print(f"✅ Found sheet by name: '{self.MATRIX_TAB}'")
             except gspread.WorksheetNotFound:
-                # Try by sheet ID (from your URL: gid=398422902)
                 sheet = spreadsheet.get_worksheet_by_id(398422902)
                 print(f"✅ Found sheet by ID: 398422902")
-                if sheet:
-                    print(f"✅ Sheet title is actually: '{sheet.title}'")
             
             all_values = sheet.get_all_values()
             
@@ -109,50 +105,30 @@ class DogReassignmentSystem:
                 print("❌ Distance matrix sheet is empty")
                 return
             
-            # Get dog IDs from the first row - check if they start from column A or B
-            first_row = all_values[0]
+            # Get COLUMN dog IDs from first row (B1, C1, D1, etc.)
+            column_dog_ids = [val.strip() for val in all_values[0][1:] if val.strip()]
+            print(f"📋 Found {len(column_dog_ids)} dog IDs in header row")
+            print(f"   Sample column IDs: {column_dog_ids[:5]}...")
             
-            print(f"🔍 Checking first row format:")
-            print(f"   A1: '{first_row[0] if len(first_row) > 0 else 'EMPTY'}'")
-            print(f"   B1: '{first_row[1] if len(first_row) > 1 else 'EMPTY'}'")
-            print(f"   C1: '{first_row[2] if len(first_row) > 2 else 'EMPTY'}'")
+            # Get ROW dog IDs from column A (A2, A3, A4, etc.)
+            row_dog_ids = []
+            for row in all_values[1:]:  # Skip header row
+                if len(row) > 0 and row[0].strip():
+                    row_dog_ids.append(row[0].strip())
             
-            # More robust detection - check if A1 looks like a dog ID
-            a1_is_dog_id = (len(first_row) > 0 and 
-                           first_row[0].strip() and 
-                           (first_row[0].strip().endswith('x') or 
-                            first_row[0].strip().isdigit() or
-                            any(char.isdigit() for char in first_row[0].strip())))
-            
-            if a1_is_dog_id:
-                # Dog IDs start from column A
-                dog_ids = [val.strip() for val in first_row if val.strip()]
-                print(f"🔍 Dog IDs start from column A (detected: A1='{first_row[0].strip()}')")
-                col_offset = 0
-            else:
-                # Dog IDs start from column B (traditional format)
-                dog_ids = [val.strip() for val in first_row[1:] if val.strip()]
-                print(f"🔍 Dog IDs start from column B (A1 doesn't look like dog ID)")
-                col_offset = 1
-            
-            print(f"🔍 Found {len(dog_ids)} dog IDs in first row")
-            
-            if len(dog_ids) == 0:
-                print("❌ No dog IDs found in distance matrix headers")
-                return
-            
-            # Show sample IDs for verification
-            print(f"📋 Sample dog IDs: {dog_ids[:5]}...")
+            print(f"📋 Found {len(row_dog_ids)} dog IDs in column A")
+            print(f"   Sample row IDs: {row_dog_ids[:5]}...")
             
             # Build distance matrix
             distances_loaded = 0
-            for i, row in enumerate(all_values[1:], 1):
-                if len(row) > 1 and row[0].strip():  # Check if row has a dog ID in first column
-                    from_dog = row[0].strip()  # Get from_dog from first column of data row
-                    # Distance data always starts from column B (index 1), regardless of header format
-                    for j, distance_str in enumerate(row[1:], 0):  # Always start from column B
-                        if j < len(dog_ids) and distance_str.strip():
-                            to_dog = dog_ids[j]  # Get to_dog from header row
+            for row_idx, row in enumerate(all_values[1:]):  # Skip header row
+                if len(row) > 0 and row[0].strip():
+                    from_dog = row[0].strip()  # Dog ID from column A
+                    
+                    # Distances start from column B (index 1)
+                    for col_idx, distance_str in enumerate(row[1:]):
+                        if col_idx < len(column_dog_ids) and distance_str.strip():
+                            to_dog = column_dog_ids[col_idx]  # Dog ID from header row
                             try:
                                 distance = float(distance_str)
                                 if from_dog not in self.distance_matrix:
@@ -162,18 +138,18 @@ class DogReassignmentSystem:
                             except (ValueError, TypeError):
                                 pass
             
-            print(f"✅ Loaded distance matrix with {len(dog_ids)} dogs")
+            print(f"✅ Loaded distance matrix with {len(row_dog_ids)} x {len(column_dog_ids)} dogs")
             print(f"✅ Loaded {distances_loaded} distance values")
-            if dog_ids:
-                sample_id = dog_ids[0]
-                if sample_id.endswith('x'):
-                    print(f"   ℹ️  Note: Matrix IDs have 'x' suffix (e.g., '{sample_id}')")
-                    
+            
+            # Verify it's working
+            if self.distance_matrix:
+                sample_from = list(self.distance_matrix.keys())[0]
+                sample_to = list(self.distance_matrix[sample_from].keys())[0]
+                sample_dist = self.distance_matrix[sample_from][sample_to]
+                print(f"✅ Sample distance: {sample_from} → {sample_to} = {sample_dist}mi")
+                
         except Exception as e:
             print(f"❌ Error loading distance matrix: {e}")
-            print(f"   Sheet ID: {self.DISTANCE_MATRIX_SHEET_ID}")
-            print(f"   Tab name: {self.MATRIX_TAB}")
-            print("   💡 Try running the debug function (option 4) to verify setup")
             self.distance_matrix = {}
 
     def load_dog_coordinates(self):
@@ -745,8 +721,8 @@ class DogReassignmentSystem:
                     batch = updates[i:i+25]
                     for update in batch:
                         sheet.update(update['values'], update['range'])
-                        time.sleep(0.5)  # Small delay between each update
-                    time.sleep(3)  # Longer delay between batches
+                        time.sleep(1)  # Increased delay
+                    time.sleep(5)  # Increased delay between batches
                     print(f"📊 Updated batch {i//25 + 1}/{(len(updates)-1)//25 + 1}")
                 
                 print(f"✅ Updated {len(updates)} assignments in Google Sheets")
@@ -1094,29 +1070,4 @@ def main():
         
         if choice in ['1', '3']:
             assignments_made = system.reassign_dogs_closest_first_strategy()
-            swaps_made = system.optimize_existing_assignments_with_swaps()
-            system.write_results_to_sheets()
-        
-        if choice == '4':
-            system.debug_distance_issues()
-            return  # Exit after debug, don't continue with other operations
-        
-        system.report_haversine_usage()
-        system.send_slack_notification(assignments_made, swaps_made)
-        
-        print(f"\n🎉 Process completed successfully!")
-        print(f"📊 Final Summary:")
-        print(f"   - New assignments: {assignments_made}")
-        print(f"   - Swaps made: {swaps_made}")
-        
-    except KeyboardInterrupt:
-        print(f"\n⏹️  Process interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
+            swaps_made = system.optimize_exis
