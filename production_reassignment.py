@@ -147,11 +147,12 @@ class DogReassignmentSystem:
             # Build distance matrix
             distances_loaded = 0
             for i, row in enumerate(all_values[1:], 1):
-                if i <= len(dog_ids):
-                    from_dog = dog_ids[i-1]
-                    for j, distance_str in enumerate(row[col_offset:], 0):
+                if len(row) > 1 and row[0].strip():  # Check if row has a dog ID in first column
+                    from_dog = row[0].strip()  # Get from_dog from first column of data row
+                    # Distance data always starts from column B (index 1), regardless of header format
+                    for j, distance_str in enumerate(row[1:], 0):  # Always start from column B
                         if j < len(dog_ids) and distance_str.strip():
-                            to_dog = dog_ids[j]
+                            to_dog = dog_ids[j]  # Get to_dog from header row
                             try:
                                 distance = float(distance_str)
                                 if from_dog not in self.distance_matrix:
