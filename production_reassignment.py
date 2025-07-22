@@ -7,8 +7,18 @@ Flexible capacity: 8-12 dogs based on route density (max 12)
 """
 
 import os
-import gspread
-from google.oauth2.service_account import Credentials
+import sys
+import traceback
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError as e:
+    print(f"ERROR: Missing required package: {e}")
+    print("Please install required packages:")
+    print("  pip install gspread google-auth google-auth-oauthlib google-auth-httplib2")
+    sys.exit(1)
+
 from collections import defaultdict
 import json
 import math
@@ -29,78 +39,117 @@ class DogReassignmentSystem:
         
     def setup_google_sheets(self):
         """Setup Google Sheets connection"""
-        creds = Credentials.from_service_account_file(
-            'service_account_key.json',
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        self.gc = gspread.authorize(creds)
-        
-        # Production sheet
-        self.sheet = self.gc.open_by_key('1m5bCsRQ4avq-p-cGVmHlXTilkRNrS8fNLfRx1F5E6oQ')
-        self.drivers_ws = self.sheet.worksheet('Driver View')
-        self.time_ws = self.sheet.worksheet('Driving Time')
+        try:
+            # Check if service account file exists
+            if not os.path.exists('service_account_key.json'):
+                print("ERROR: service_account_key.json not found!")
+                print("Please ensure the service account key file is in the current directory.")
+                sys.exit(1)
+                
+            creds = Credentials.from_service_account_file(
+                'service_account_key.json',
+                scopes=['https://www.googleapis.com/auth/spreadsheets']
+            )
+            self.gc = gspread.authorize(creds)
+            
+            # Production sheet
+            self.sheet = self.gc.open_by_key('1m5bCsRQ4avq-p-cGVmHlXTilkRNrS8fNLfRx1F5E6oQ')
+            self.drivers_ws = self.sheet.worksheet('Driver View')
+            self.time_ws = self.sheet.worksheet('Driving Time')
+            
+        except Exception as e:
+            print(f"ERROR: Failed to setup Google Sheets connection: {e}")
+            print(f"Error type: {type(e).__name__}")
+            traceback.print_exc()
+            sys.exit(1)
         
     def load_data(self):
         """Load all data from Google Sheets"""
         print("Loading data from Google Sheets...")
         
-        # Load driver assignments and groups
-        print("Loading driver assignments...")
-        drivers_data = self.drivers_ws.get_all_values()
-        
-        # Skip header rows and load assignments
-        for row_idx, row in enumerate(drivers_data[3:], start=4):  # Starting from row 4
-            driver = row[0] if row[0] else None
+        try:
+            # Load driver assignments and groups
+            print("Loading driver assignments...")
+            drivers_data = self.drivers_ws.get_all_values()
             
-            # Load all 3 groups for this driver
-            for group in [1, 2, 3]:
-                col_idx = 2 + (group - 1) * 2  # Columns C, E, G
-                if col_idx < len(row) and row[col_idx]:
-                    dogs = [d.strip() for d in row[col_idx].split(',') if d.strip()]
-                    for dog in dogs:
-                        self.driver_assignments[dog] = driver
-                        self.dog_groups[dog] = group
-                        self.all_dogs.add(dog)
-                        if driver:
-                            self.active_drivers.add(driver)
-        
-        # Identify callout dogs (dogs without drivers)
-        self.callout_dogs = {dog for dog in self.all_dogs if not self.driver_assignments.get(dog)}
-        
-        print(f"Loaded {len(self.all_dogs)} dogs")
-        print(f"Found {len(self.callout_dogs)} callout dogs")
-        print(f"Active drivers: {len(self.active_drivers)}")
-        
-        # Load time matrix
-        print("Loading time matrix...")
-        self.load_time_matrix()
-        
-        # Load dog coordinates
-        print("Loading dog coordinates...")
-        self.load_dog_coordinates()
+            if len(drivers_data) < 4:
+                print("ERROR: Driver sheet appears to be empty or malformed!")
+                sys.exit(1)
+            
+            # Skip header rows and load assignments
+            for row_idx, row in enumerate(drivers_data[3:], start=4):  # Starting from row 4
+                driver = row[0] if row[0] else None
+                
+                # Load all 3 groups for this driver
+                for group in [1, 2, 3]:
+                    col_idx = 2 + (group - 1) * 2  # Columns C, E, G
+                    if col_idx < len(row) and row[col_idx]:
+                        dogs = [d.strip() for d in row[col_idx].split(',') if d.strip()]
+                        for dog in dogs:
+                            self.driver_assignments[dog] = driver
+                            self.dog_groups[dog] = group
+                            self.all_dogs.add(dog)
+                            if driver:
+                                self.active_drivers.add(driver)
+            
+            # Identify callout dogs (dogs without drivers)
+            self.callout_dogs = {dog for dog in self.all_dogs if not self.driver_assignments.get(dog)}
+            
+            print(f"Loaded {len(self.all_dogs)} dogs")
+            print(f"Found {len(self.callout_dogs)} callout dogs")
+            print(f"Active drivers: {len(self.active_drivers)}")
+            
+            if len(self.all_dogs) == 0:
+                print("ERROR: No dogs found in the sheet!")
+                sys.exit(1)
+            
+            # Load time matrix
+            print("Loading time matrix...")
+            self.load_time_matrix()
+            
+            # Load dog coordinates
+            print("Loading dog coordinates...")
+            self.load_dog_coordinates()
+            
+        except Exception as e:
+            print(f"ERROR: Failed to load data: {e}")
+            traceback.print_exc()
+            sys.exit(1)
         
     def load_time_matrix(self):
         """Load driving time matrix"""
-        time_data = self.time_ws.get_all_values()
-        
-        # First row contains dog names
-        dogs_in_matrix = time_data[0][1:]  # Skip first cell
-        
-        # Load times
-        for row_idx, row in enumerate(time_data[1:], start=1):
-            dog1 = row[0]
-            for col_idx, time_str in enumerate(row[1:], start=1):
-                if col_idx - 1 < len(dogs_in_matrix):
-                    dog2 = dogs_in_matrix[col_idx - 1]
-                    if time_str:
-                        try:
-                            time_val = float(time_str)
-                            self.time_matrix[(dog1, dog2)] = time_val
-                            self.time_matrix[(dog2, dog1)] = time_val
-                        except (ValueError, TypeError):
-                            pass
-        
-        print(f"Loaded {len(self.time_matrix)} time entries")
+        try:
+            time_data = self.time_ws.get_all_values()
+            
+            if not time_data or len(time_data) < 2:
+                print("WARNING: Time matrix appears to be empty!")
+                return
+            
+            # First row contains dog names
+            dogs_in_matrix = time_data[0][1:]  # Skip first cell
+            
+            # Load times
+            for row_idx, row in enumerate(time_data[1:], start=1):
+                if not row:
+                    continue
+                    
+                dog1 = row[0]
+                for col_idx, time_str in enumerate(row[1:], start=1):
+                    if col_idx - 1 < len(dogs_in_matrix):
+                        dog2 = dogs_in_matrix[col_idx - 1]
+                        if time_str:
+                            try:
+                                time_val = float(time_str)
+                                self.time_matrix[(dog1, dog2)] = time_val
+                                self.time_matrix[(dog2, dog1)] = time_val
+                            except (ValueError, TypeError):
+                                pass
+            
+            print(f"Loaded {len(self.time_matrix)} time entries")
+            
+        except Exception as e:
+            print(f"WARNING: Failed to load time matrix: {e}")
+            print("Will use haversine fallback for all distances.")
         
     def load_dog_coordinates(self):
         """Load dog coordinates for haversine calculations"""
@@ -1257,20 +1306,31 @@ class DogReassignmentSystem:
         print(f"  Protected clusters maintained: {len(self.protected_clusters)} dogs")
         
 def main():
-    system = DogReassignmentSystem()
-    
-    # Load data
-    system.load_data()
-    
-    # Run optimization
-    moves = system.optimize_routes()
-    
-    # Update Google Sheets
-    if moves:
-        system.update_google_sheets()
-    
-    # Analyze results
-    system.analyze_results()
+    try:
+        print("Starting Dog Reassignment Optimization System...")
+        system = DogReassignmentSystem()
+        
+        # Load data
+        system.load_data()
+        
+        # Run optimization
+        moves = system.optimize_routes()
+        
+        # Update Google Sheets
+        if moves:
+            system.update_google_sheets()
+        
+        # Analyze results
+        system.analyze_results()
+        
+    except KeyboardInterrupt:
+        print("\n\nOptimization cancelled by user.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n\nERROR: An unexpected error occurred: {e}")
+        print(f"Error type: {type(e).__name__}")
+        traceback.print_exc()
+        sys.exit(1)
     
 if __name__ == "__main__":
     main()
