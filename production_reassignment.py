@@ -10,6 +10,11 @@ import os
 import sys
 import traceback
 
+# Check Python version
+if sys.version_info < (3, 6):
+    print(f"ERROR: Python 3.6 or higher is required. You are using Python {sys.version}")
+    sys.exit(1)
+
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -40,22 +45,43 @@ class DogReassignmentSystem:
     def setup_google_sheets(self):
         """Setup Google Sheets connection"""
         try:
-            # Check if service account file exists
-            if not os.path.exists('service_account_key.json'):
-                print("ERROR: service_account_key.json not found!")
-                print("Please ensure the service account key file is in the current directory.")
-                sys.exit(1)
-                
-            creds = Credentials.from_service_account_file(
-                'service_account_key.json',
-                scopes=['https://www.googleapis.com/auth/spreadsheets']
-            )
+            # Check if running in GitHub Actions or with environment credentials
+            creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON') or os.environ.get('GOOGLE_CREDENTIALS')
+            
+            if creds_json:
+                print("Using credentials from environment variable")
+                try:
+                    creds_info = json.loads(creds_json)
+                    creds = Credentials.from_service_account_info(
+                        creds_info,
+                        scopes=['https://www.googleapis.com/auth/spreadsheets']
+                    )
+                except json.JSONDecodeError as e:
+                    print(f"ERROR: Failed to parse JSON credentials: {e}")
+                    sys.exit(1)
+            else:
+                # Check if service account file exists
+                if not os.path.exists('service_account_key.json'):
+                    print("ERROR: service_account_key.json not found!")
+                    print("Please ensure either:")
+                    print("  1. The service account key file is in the current directory, OR")
+                    print("  2. Set GOOGLE_SERVICE_ACCOUNT_JSON environment variable with the JSON content")
+                    sys.exit(1)
+                    
+                print("Using credentials from service_account_key.json file")
+                creds = Credentials.from_service_account_file(
+                    'service_account_key.json',
+                    scopes=['https://www.googleapis.com/auth/spreadsheets']
+                )
+            
             self.gc = gspread.authorize(creds)
             
             # Production sheet
             self.sheet = self.gc.open_by_key('1m5bCsRQ4avq-p-cGVmHlXTilkRNrS8fNLfRx1F5E6oQ')
             self.drivers_ws = self.sheet.worksheet('Driver View')
             self.time_ws = self.sheet.worksheet('Driving Time')
+            
+            print("Successfully connected to Google Sheets")
             
         except Exception as e:
             print(f"ERROR: Failed to setup Google Sheets connection: {e}")
@@ -1307,7 +1333,16 @@ class DogReassignmentSystem:
         
 def main():
     try:
-        print("Starting Dog Reassignment Optimization System...")
+        print("="*60)
+        print("Dog Reassignment Optimization System")
+        print(f"Python version: {sys.version}")
+        print("="*60)
+        
+        # Debug mode check
+        debug = os.environ.get('DEBUG', '').lower() == 'true'
+        if debug:
+            print("DEBUG MODE ENABLED")
+        
         system = DogReassignmentSystem()
         
         # Load data
@@ -1318,16 +1353,21 @@ def main():
         
         # Update Google Sheets
         if moves:
-            system.update_google_sheets()
+            if os.environ.get('DRY_RUN', '').lower() == 'true':
+                print("\nDRY RUN MODE - Skipping Google Sheets update")
+            else:
+                system.update_google_sheets()
         
         # Analyze results
         system.analyze_results()
         
+        print("\n✅ Optimization completed successfully!")
+        
     except KeyboardInterrupt:
-        print("\n\nOptimization cancelled by user.")
+        print("\n\n❌ Optimization cancelled by user.")
         sys.exit(0)
     except Exception as e:
-        print(f"\n\nERROR: An unexpected error occurred: {e}")
+        print(f"\n\n❌ ERROR: An unexpected error occurred: {e}")
         print(f"Error type: {type(e).__name__}")
         traceback.print_exc()
         sys.exit(1)
