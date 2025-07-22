@@ -174,7 +174,7 @@ class DogReassignmentSystem:
                 from_dog_id = row[0].strip()
                 
                 for col_index in range(1, min(len(row), len(column_dog_ids) + 1)):
-                    if row[col_index].strip():
+                    if col_index < len(row) and row[col_index] and row[col_index].strip():
                         to_dog_id = column_dog_ids[col_index - 1]
                         
                         try:
@@ -217,18 +217,19 @@ class DogReassignmentSystem:
             coordinates_loaded = 0
             for row in all_values[1:]:
                 if len(row) > max(lat_idx, lng_idx, dog_id_idx):
-                    dog_id = row[dog_id_idx].strip() if row[dog_id_idx] else ""
-                    lat_str = row[lat_idx].strip() if row[lat_idx] else ""
-                    lng_str = row[lng_idx].strip() if row[lng_idx] else ""
-                    
-                    if dog_id and lat_str and lng_str:
-                        try:
+                    try:
+                        dog_id = row[dog_id_idx].strip() if row[dog_id_idx] else ""
+                        lat_str = row[lat_idx].strip() if row[lat_idx] else ""
+                        lng_str = row[lng_idx].strip() if row[lng_idx] else ""
+                        
+                        if dog_id and lat_str and lng_str:
                             lat = float(lat_str)
                             lng = float(lng_str)
-                            self.dog_coordinates[dog_id] = (lat, lng)
-                            coordinates_loaded += 1
-                        except ValueError:
-                            pass
+                            if -90 <= lat <= 90 and -180 <= lng <= 180:  # Valid coordinates
+                                self.dog_coordinates[dog_id] = (lat, lng)
+                                coordinates_loaded += 1
+                    except (ValueError, IndexError):
+                        pass
             
             print(f"✅ Loaded coordinates for {coordinates_loaded} dogs")
             
@@ -244,6 +245,10 @@ class DogReassignmentSystem:
         lat1, lon1 = self.dog_coordinates[dog_id1]
         lat2, lon2 = self.dog_coordinates[dog_id2]
         
+        # Check for same location
+        if lat1 == lat2 and lon1 == lon2:
+            return 0.0
+        
         # Convert to radians
         lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
         lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
@@ -252,6 +257,10 @@ class DogReassignmentSystem:
         dlat = lat2_rad - lat1_rad
         dlon = lon2_rad - lon1_rad
         a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
+        
+        # Clamp to avoid numerical errors
+        a = min(1.0, max(0.0, a))
+        
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         
         # Earth's radius in miles
@@ -263,7 +272,7 @@ class DogReassignmentSystem:
         driving_miles = distance_miles * driving_factor
         driving_minutes = driving_miles * self.MILES_TO_MINUTES
         
-        return driving_minutes
+        return max(0.0, driving_minutes)  # Ensure non-negative
 
     def get_time_with_fallback(self, dog_id1, dog_id2):
         """Get driving time between dogs with haversine fallback"""
@@ -414,8 +423,12 @@ class DogReassignmentSystem:
         Threshold: > 0.7 dogs/minute is acceptable
         Example: 5 dogs for 7 minutes = 0.71 ✓
         """
-        if detour_minutes <= 0:
-            return float('inf')  # No detour needed
+        if detour_minutes <= 0 or dogs_collected <= 0:
+            return {
+                'value': float('inf') if detour_minutes <= 0 else 0,
+                'is_acceptable': detour_minutes <= 0,
+                'dogs_per_minute': float('inf') if detour_minutes <= 0 else 0
+            }
         
         value = dogs_collected / detour_minutes
         is_acceptable = value > 0.7
@@ -450,6 +463,11 @@ class DogReassignmentSystem:
         """
         print("\n🎯 PHASE 1: Assigning ALL callouts to closest driver (ignoring capacity)")
         print("=" * 60)
+        
+        # Check if we have any active drivers
+        if not self.active_drivers:
+            print("❌ No active drivers available for assignment!")
+            return 0
         
         # Find all callouts that need assignment
         callouts = []
@@ -560,6 +578,10 @@ class DogReassignmentSystem:
                 drivers_to_consolidate.append((driver, dogs))
         
         print(f"🔍 Found {len(drivers_to_consolidate)} drivers to consolidate")
+        
+        if not drivers_to_consolidate:
+            print("✅ No small drivers to consolidate")
+            return 0
         
         dogs_moved = 0
         
@@ -1260,6 +1282,13 @@ class DogReassignmentSystem:
             # Sort by connectivity score (worst connectivity = highest score = move first)
             dogs_with_connectivity.sort(key=lambda x: -x['score'])
             
+            if not dogs_with_connectivity:
+                print("\n   ❌ ERROR: No valid alternative placements found for any dogs!")
+                print("      All dogs may be too isolated or no other drivers have capacity.")
+                print("      Manual intervention required.")
+                # Skip to next over-capacity group
+                continue
+            
             print("\nDogs ranked by connectivity (worst connected = move first):")
             for i, dog_data in enumerate(dogs_with_connectivity[:10]):  # Show top 10
                 status = "→ MOVE" if i < dogs_to_move_count else ""
@@ -1400,7 +1429,7 @@ class DogReassignmentSystem:
                 'driver': driver,
                 'group': current_group,  # Always same group
                 'time': avg_time,
-                'capacity_remaining': capacity - group_count - 1
+                'capacity_remaining': capacity - group_count
             })
         
         if not best_options:
@@ -1745,12 +1774,25 @@ class DogReassignmentSystem:
                             status = " 🔗 CLUSTERED"
                         else:
                             # Check if it's a regular outlier using new aggressive rules
-                            if times:
+                            if times and len(times) > 0:
                                 # Use more aggressive threshold
                                 threshold = min(avg * self.OUTLIER_MULTIPLIER, self.OUTLIER_ABSOLUTE)
-                                avg_to_others = sum(times) / len(times)
-                                if avg_to_others > threshold or min_time_to_neighbor > 3:
-                                    status = " ⚠️ OUTLIER"
+                                # Calculate this dog's average to others
+                                dog_times_to_others = []
+                                for other_dog in dogs:
+                                    if other_dog != dog:
+                                        other_id = other_dog.get('dog_id', '')
+                                        if other_id and dog_id:
+                                            time_to_other = self.get_time_with_fallback(dog_id, other_id)
+                                            if time_to_other < float('inf'):
+                                                dog_times_to_others.append(time_to_other)
+                                
+                                if dog_times_to_others:
+                                    avg_to_others = sum(dog_times_to_others) / len(dog_times_to_others)
+                                    if avg_to_others > threshold or min_time_to_neighbor > 3:
+                                        status = " ⚠️ OUTLIER"
+                                    else:
+                                        status = ""
                                 else:
                                     status = ""
                             else:
