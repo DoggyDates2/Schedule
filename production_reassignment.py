@@ -5,6 +5,7 @@ Dog Assignment Optimization System - TIME-BASED (MINUTES)
 UPDATE: Now 7 phases with improved outlier detection and smarter group consolidation.
 - Outliers: Dogs > 1.5x average OR > 3 min from average OR > 3 min from nearest neighbor
 - Small groups: Each dog moved to its closest individual neighbor
+- Phase 6: Uses nearest neighbor approach to preserve route efficiency
 
 OPTIMIZATION STRATEGY (7 PHASES):
 1. Phase 1: Assign ALL callout dogs to closest driver (ignore capacity)
@@ -20,8 +21,9 @@ OPTIMIZATION STRATEGY (7 PHASES):
    - Only if driver has all 3 groups
    - Never leaves driver with just one group
    - Each dog moves to its closest individual neighbor
-6. Phase 6: Balance capacity by fixing remaining over-capacity groups
-   - Moves extreme outliers (> 5 min from nearest neighbor)
+6. Phase 6: Balance capacity by moving dogs with worst connectivity
+   - Uses nearest neighbor approach to preserve route chains
+   - Moves isolated dogs first (high min distance to nearest neighbor)
 7. Phase 7: Balance workloads between drivers (max 2 min added time)
    - Even out dog counts across drivers
 
@@ -1129,14 +1131,16 @@ class DogReassignmentSystem:
         return moves_made
 
     def phase6_balance_capacity(self):
-        """PHASE 6 (was 5): Balance capacity by moving extreme outliers from over-capacity groups
+        """PHASE 6: Balance capacity by enforcing hard capacity limits
         
-        Fixes over-capacity issues after Phase 4 has already moved regular outliers.
-        Only looks at groups that are still over capacity.
-        Extreme outliers are dogs > 5 min from their nearest neighbor.
+        Uses NEAREST NEIGHBOR approach for route efficiency:
+        - Ranks dogs by their minimum distance to nearest neighbor
+        - Preserves connected chains of dogs
+        - Moves isolated dogs first (those requiring detours)
+        
         Dogs stay in their assigned groups (1, 2, 3).
         """
-        print("\n⚖️ PHASE 6: Balancing capacity")
+        print("\n⚖️ PHASE 6: Balancing capacity (NEAREST NEIGHBOR approach)")
         print("=" * 60)
         
         moves_made = 0
@@ -1183,62 +1187,121 @@ class DogReassignmentSystem:
                 print("✅ All groups within capacity!")
                 break
             
-            # Sort by density (most dense first) and over-capacity amount
-            over_capacity_groups.sort(key=lambda x: (x['avg_time'], -x['over_by']))
+            # Sort by how much they're over (most over first)
+            over_capacity_groups.sort(key=lambda x: -x['over_by'])
             
             print(f"Found {len(over_capacity_groups)} over-capacity groups")
             
-            # Process the most problematic group
+            # Process the most over-capacity group
             group_to_fix = over_capacity_groups[0]
+            dogs_to_move_count = group_to_fix['over_by']
+            
             print(f"\n🎯 Fixing {group_to_fix['driver']} Group {group_to_fix['group']}: "
-                  f"{group_to_fix['count']}/{group_to_fix['capacity']} dogs")
+                  f"{group_to_fix['count']}/{group_to_fix['capacity']} dogs "
+                  f"(need to move {dogs_to_move_count} dogs)")
             
-            # Find outliers in this group
-            outliers = self.find_group_outliers(group_to_fix['dogs'])
+            # Analyze connectivity for each dog
+            dogs_with_connectivity = []
             
-            if not outliers:
-                print(f"   No extreme outliers found (all dogs within {self.OUTLIER_THRESHOLD} min of a neighbor)")
-                continue
-            
-            print(f"   Found {len(outliers)} outlier(s) in group:")
-            for outlier in outliers[:3]:  # Show top 3 outliers
-                print(f"     - {outlier['dog'].get('dog_name', 'Unknown')}: "
-                      f"{outlier['min_time_to_nearest']:.1f} min from nearest neighbor")
-            
-            # Try to move the most distant outlier
-            moved = False
-            for outlier in outliers[:1]:  # Move one at a time
-                dog_name = outlier['dog'].get('dog_name', 'Unknown')
-                dog_id = outlier['dog'].get('dog_id', '')
+            for dog in group_to_fix['dogs']:
+                dog_id = dog.get('dog_id', '')
+                dog_name = dog.get('dog_name', 'Unknown')
                 
-                print(f"   🎯 Attempting to move outlier: {dog_name} "
-                      f"({outlier['min_time_to_nearest']:.1f} min from nearest neighbor)")
+                if not dog_id:
+                    continue
+                
+                # Find minimum distance to any neighbor and count close neighbors
+                min_distance = float('inf')
+                close_neighbors = 0  # Count of neighbors within 1 minute
+                very_close_neighbors = 0  # Count of neighbors within 0.5 minutes
+                
+                for other_dog in group_to_fix['dogs']:
+                    if other_dog != dog:
+                        other_id = other_dog.get('dog_id', '')
+                        if other_id:
+                            time_min = self.get_time_with_fallback(dog_id, other_id)
+                            if time_min < float('inf'):
+                                if time_min < min_distance:
+                                    min_distance = time_min
+                                if time_min <= 1.0:
+                                    close_neighbors += 1
+                                if time_min <= 0.5:
+                                    very_close_neighbors += 1
                 
                 # Find best alternative placement
-                best_option = self.find_best_alternative_placement(
-                    outlier['dog'], group_to_fix['group'], group_to_fix['driver']
+                best_alt = self.find_best_alternative_placement(
+                    dog, group_to_fix['group'], group_to_fix['driver']
                 )
                 
-                if best_option:
-                    # CRITICAL: Dogs keep their group numbers - only driver changes
-                    # Dogs MUST stay in their assigned group (1, 2, or 3)
-                    old_combined = outlier['dog']['combined']
-                    original_groups = old_combined.split(':', 1)[1]
-                    new_combined = f"{best_option['driver']}:{original_groups}"
-                    outlier['dog']['combined'] = new_combined
+                if best_alt:
+                    # Connectivity score: higher = WORSE connectivity (better candidate to move)
+                    # Prioritize dogs with:
+                    # 1. High minimum distance to nearest neighbor (isolated)
+                    # 2. Few close neighbors
+                    # 3. Good alternative placement available
                     
-                    print(f"   ✅ Moved {dog_name}: {old_combined} → {new_combined} "
-                          f"({best_option['time']:.1f} min)")
-                    moves_made += 1
-                    moved = True
-                    break
-                else:
-                    print(f"   ❌ No suitable alternative found for {dog_name}")
+                    connectivity_score = (
+                        min_distance * 10 +  # Weight minimum distance heavily
+                        (10 / (close_neighbors + 1)) +  # Inverse of close neighbors
+                        (5 / (very_close_neighbors + 1)) +  # Bonus for lacking very close neighbors
+                        (10 / (best_alt['time'] + 1))  # Better if good alternative exists
+                    )
+                    
+                    dogs_with_connectivity.append({
+                        'dog': dog,
+                        'dog_name': dog_name,
+                        'min_distance': min_distance,
+                        'close_neighbors': close_neighbors,
+                        'very_close_neighbors': very_close_neighbors,
+                        'best_alt': best_alt,
+                        'score': connectivity_score
+                    })
             
-            if not moved:
-                print("   ⚠️  Could not resolve this group - routes may be well-connected")
+            # Sort by connectivity score (worst connectivity = highest score = move first)
+            dogs_with_connectivity.sort(key=lambda x: -x['score'])
+            
+            print("\nDogs ranked by connectivity (worst connected = move first):")
+            for i, dog_data in enumerate(dogs_with_connectivity[:10]):  # Show top 10
+                status = "→ MOVE" if i < dogs_to_move_count else ""
+                print(f"   {dog_data['dog_name']}: "
+                      f"nearest neighbor {dog_data['min_distance']:.1f} min, "
+                      f"{dog_data['close_neighbors']} neighbors <1min "
+                      f"{status}")
+            
+            # Move the required number of dogs
+            dogs_moved_this_iteration = 0
+            
+            for i in range(min(dogs_to_move_count, len(dogs_with_connectivity))):
+                dog_data = dogs_with_connectivity[i]
+                dog = dog_data['dog']
+                best_alt = dog_data['best_alt']
+                
+                # CRITICAL: Dogs keep their group numbers - only driver changes
+                old_combined = dog['combined']
+                original_groups = old_combined.split(':', 1)[1]
+                new_combined = f"{best_alt['driver']}:{original_groups}"
+                dog['combined'] = new_combined
+                
+                print(f"\n   ✅ Moved {dog_data['dog_name']}: {old_combined} → {new_combined}")
+                print(f"      Connectivity: nearest neighbor was {dog_data['min_distance']:.1f} min away")
+                print(f"      Had {dog_data['close_neighbors']} neighbors within 1 min")
+                print(f"      New group average: {best_alt['time']:.1f} min")
+                
+                moves_made += 1
+                dogs_moved_this_iteration += 1
+            
+            if dogs_moved_this_iteration == 0:
+                print("\n   ❌ ERROR: No dogs could be moved! Group will remain over capacity.")
+                print("      This may indicate all dogs are tightly connected.")
+                print("      Manual intervention may be needed.")
+                # Continue to next group instead of getting stuck
+                continue
+            
+            print(f"\n   Moved {dogs_moved_this_iteration} dogs this iteration")
         
         print(f"\n✅ Phase 6 Complete: {moves_made} moves made")
+        if moves_made > 0:
+            print("   (Moved dogs with worst connectivity to preserve route efficiency)")
         return moves_made
 
     def find_group_outliers(self, dogs):
@@ -1806,7 +1869,7 @@ class DogReassignmentSystem:
                                    f"• Total dogs: {total_dogs}\n"
                                    f"• Utilization: {utilization:.1f}%\n"
                                    f"• Optimization strategy: Time-based (minutes)\n"
-                                   f"• 7-phase optimization with small group consolidation"
+                                   f"• 7-phase optimization with nearest neighbor capacity enforcement"
                         }
                     }
                 ]
