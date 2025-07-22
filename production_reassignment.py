@@ -2,8 +2,9 @@
 """
 Dog Assignment Optimization System - TIME-BASED (MINUTES)
 
-UPDATE: Now 6 phases with improved outlier detection.
-Phase 4 removes outliers from ALL groups before worrying about capacity.
+UPDATE: Now 7 phases with improved outlier detection and smarter group consolidation.
+- Outliers: Dogs > 1.5x average OR > 3 min from average OR > 3 min from nearest neighbor
+- Small groups: Each dog moved to its closest individual neighbor
 
 OPTIMIZATION STRATEGY (7 PHASES):
 1. Phase 1: Assign ALL callout dogs to closest driver (ignore capacity)
@@ -24,17 +25,16 @@ OPTIMIZATION STRATEGY (7 PHASES):
 7. Phase 7: Balance workloads between drivers (max 2 min added time)
    - Even out dog counts across drivers
 
-WHY THIS WORKS:
-- Phase 3 creates natural clusters
-- Phase 4 removes outliers BEFORE worrying about capacity
-- Phase 5 then fixes any remaining capacity issues
-- Phase 6 ensures fair workload distribution
+KEY RULES:
+- Never leave a driver with only one group
+- Never eliminate Group 2 (would create dead time)
+- Dogs NEVER change groups (1, 2, 3) - only drivers
 
 KEY CONCEPTS:
 - All distances now in MINUTES of driving time
-- Dogs NEVER change groups (1, 2, 3) - only drivers
 - Nearby dogs (< 1 min) should go to same driver for efficiency
-- Outliers = dogs > 2x average distance from others in their group
+- Outliers = dogs > 1.5x average distance OR > 3 min from average
+- Also outliers: dogs > 3 min from nearest neighbor
 - Dense routes (avg < 2 min): capacity 12 dogs
 - Standard routes: capacity 8 dogs
 - Detour value: Must collect > 0.7 dogs/minute for detour to be worthwhile
@@ -950,14 +950,193 @@ class DogReassignmentSystem:
             print(f"   (Using aggressive criteria: > 1.5x avg OR > 3 min absolute OR > 3 min to nearest)")
         return moves_made
 
-    def phase5_balance_capacity(self):
-        """PHASE 5 (was 4): Balance capacity by moving outliers from dense groups
+    def phase5_consolidate_small_groups(self):
+        """PHASE 5: Consolidate small Group 1 or Group 3 assignments
         
-        Fixes over-capacity issues by identifying and moving outlier dogs.
-        Outliers are dogs > 5 min from their nearest neighbor.
+        If a driver has < 4 dogs in Group 1 or Group 3, redistribute those dogs.
+        Each dog is moved to its CLOSEST neighbor in the same group number.
+        
+        CRITICAL RULES:
+        - Only consolidate if driver has ALL 3 groups (1, 2, and 3)
+        - Never leave a driver with only one group (not worth coming in)
+        - Never eliminate Group 2 alone (would create dead time between pickups)
+        - Each dog goes to its individual closest neighbor (not all to same driver)
+        
+        Valid consolidations:
+        - Has Groups 1,2,3 and Group 1 < 4 dogs → move each Group 1 dog to its closest neighbor
+        - Has Groups 1,2,3 and Group 3 < 4 dogs → move each Group 3 dog to its closest neighbor
+        - Has only Groups 1,2 or 2,3 → keep as is (can't reduce further)
+        """
+        print("\n🔄 PHASE 5: Consolidating small Group 1 or Group 3 assignments")
+        print("=" * 60)
+        
+        moves_made = 0
+        
+        # Analyze each driver's groups
+        for driver in list(self.active_drivers):  # Use list() to avoid modification during iteration
+            # Count dogs per group for this driver
+            driver_groups = defaultdict(list)
+            
+            for assignment in self.dog_assignments:
+                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
+                    combined = assignment['combined']
+                    groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
+                    for group in groups:
+                        driver_groups[group].append(assignment)
+            
+            # Check which groups this driver has
+            has_group1 = 1 in driver_groups and len(driver_groups[1]) > 0
+            has_group2 = 2 in driver_groups and len(driver_groups[2]) > 0
+            has_group3 = 3 in driver_groups and len(driver_groups[3]) > 0
+            
+            group1_count = len(driver_groups[1]) if has_group1 else 0
+            group2_count = len(driver_groups[2]) if has_group2 else 0
+            group3_count = len(driver_groups[3]) if has_group3 else 0
+            
+            print(f"\n📊 {driver}: G1={group1_count}, G2={group2_count}, G3={group3_count}")
+            
+            # Determine what can be consolidated
+            can_move_group1 = False
+            can_move_group3 = False
+            
+            # Only consolidate if driver has all 3 groups
+            if has_group1 and has_group2 and has_group3:
+                if group1_count < self.MIN_GROUP_SIZE:
+                    can_move_group1 = True
+                    print(f"   ⚠️  Group 1 has only {group1_count} dogs (< {self.MIN_GROUP_SIZE})")
+                
+                if group3_count < self.MIN_GROUP_SIZE:
+                    can_move_group3 = True
+                    print(f"   ⚠️  Group 3 has only {group3_count} dogs (< {self.MIN_GROUP_SIZE})")
+            else:
+                print(f"   ℹ️  Driver doesn't have all 3 groups - preserving current assignment")
+            
+            # Move Group 1 if needed - EACH DOG TO ITS CLOSEST NEIGHBOR
+            if can_move_group1:
+                dogs_to_move = driver_groups[1]
+                print(f"   🔄 Moving {len(dogs_to_move)} dogs from Group 1 to closest neighbors:")
+                
+                for dog in dogs_to_move:
+                    dog_name = dog.get('dog_name', 'Unknown')
+                    dog_id = dog.get('dog_id', '')
+                    
+                    # Find ALL Group 1 dogs across all other drivers
+                    best_option = None
+                    best_time = float('inf')
+                    
+                    for other_driver in self.active_drivers:
+                        if other_driver == driver:
+                            continue
+                        
+                        # Get other driver's Group 1 dogs
+                        other_group1_dogs = []
+                        for assignment in self.dog_assignments:
+                            if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{other_driver}:"):
+                                groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
+                                if 1 in groups:
+                                    other_group1_dogs.append(assignment)
+                        
+                        if not other_group1_dogs:
+                            continue
+                        
+                        # Find CLOSEST single dog in this driver's Group 1
+                        for other_dog in other_group1_dogs:
+                            other_id = other_dog.get('dog_id', '')
+                            if other_id and dog_id:
+                                time_min = self.get_time_with_fallback(dog_id, other_id)
+                                if time_min < best_time:
+                                    best_time = time_min
+                                    best_option = {
+                                        'driver': other_driver,
+                                        'closest_dog': other_dog.get('dog_name', 'Unknown'),
+                                        'time': time_min
+                                    }
+                    
+                    if best_option:
+                        # Update assignment
+                        original_groups = dog['combined'].split(':', 1)[1]
+                        dog['combined'] = f"{best_option['driver']}:{original_groups}"
+                        print(f"      ✅ {dog_name} → {best_option['driver']} "
+                              f"(closest to {best_option['closest_dog']}, {best_option['time']:.1f} min)")
+                        moves_made += 1
+                    else:
+                        print(f"      ❌ No suitable destination found for {dog_name}")
+            
+            # Move Group 3 if needed - EACH DOG TO ITS CLOSEST NEIGHBOR
+            if can_move_group3:
+                dogs_to_move = driver_groups[3]
+                print(f"   🔄 Moving {len(dogs_to_move)} dogs from Group 3 to closest neighbors:")
+                
+                for dog in dogs_to_move:
+                    dog_name = dog.get('dog_name', 'Unknown')
+                    dog_id = dog.get('dog_id', '')
+                    
+                    # Find ALL Group 3 dogs across all other drivers
+                    best_option = None
+                    best_time = float('inf')
+                    
+                    for other_driver in self.active_drivers:
+                        if other_driver == driver:
+                            continue
+                        
+                        # Get other driver's Group 3 dogs
+                        other_group3_dogs = []
+                        for assignment in self.dog_assignments:
+                            if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{other_driver}:"):
+                                groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
+                                if 3 in groups:
+                                    other_group3_dogs.append(assignment)
+                        
+                        if not other_group3_dogs:
+                            continue
+                        
+                        # Find CLOSEST single dog in this driver's Group 3
+                        for other_dog in other_group3_dogs:
+                            other_id = other_dog.get('dog_id', '')
+                            if other_id and dog_id:
+                                time_min = self.get_time_with_fallback(dog_id, other_id)
+                                if time_min < best_time:
+                                    best_time = time_min
+                                    best_option = {
+                                        'driver': other_driver,
+                                        'closest_dog': other_dog.get('dog_name', 'Unknown'),
+                                        'time': time_min
+                                    }
+                    
+                    if best_option:
+                        # Update assignment
+                        original_groups = dog['combined'].split(':', 1)[1]
+                        dog['combined'] = f"{best_option['driver']}:{original_groups}"
+                        print(f"      ✅ {dog_name} → {best_option['driver']} "
+                              f"(closest to {best_option['closest_dog']}, {best_option['time']:.1f} min)")
+                        moves_made += 1
+                    else:
+                        print(f"      ❌ No suitable destination found for {dog_name}")
+            
+            # Check if driver now has no dogs
+            remaining_dogs = 0
+            for assignment in self.dog_assignments:
+                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
+                    remaining_dogs += 1
+            
+            if remaining_dogs == 0:
+                self.active_drivers.discard(driver)
+                print(f"   🏠 {driver} now has no dogs - removing from active drivers")
+        
+        print(f"\n✅ Phase 5 Complete: {moves_made} dogs moved from small groups")
+        if moves_made > 0:
+            print(f"   (Each dog moved to its closest individual neighbor)")
+        return moves_made
+
+    def phase6_balance_capacity(self):
+        """PHASE 6 (was 5): Balance capacity by moving extreme outliers from over-capacity groups
+        
+        Fixes over-capacity issues after Phase 4 has already moved regular outliers.
+        Only looks at groups that are still over capacity.
+        Extreme outliers are dogs > 5 min from their nearest neighbor.
         Dogs stay in their assigned groups (1, 2, 3).
         """
-        print("\n⚖️ PHASE 4: Balancing capacity")
+        print("\n⚖️ PHASE 6: Balancing capacity")
         print("=" * 60)
         
         moves_made = 0
@@ -1059,15 +1238,15 @@ class DogReassignmentSystem:
             if not moved:
                 print("   ⚠️  Could not resolve this group - routes may be well-connected")
         
-        print(f"\n✅ Phase 4 Complete: {moves_made} moves made")
+        print(f"\n✅ Phase 6 Complete: {moves_made} moves made")
         return moves_made
 
     def find_group_outliers(self, dogs):
         """Find extreme outlier dogs in a group based on minimum distance to nearest neighbor
         
-        Used by Phase 5 for capacity balancing.
+        Used by Phase 6 for capacity balancing.
         A dog is an extreme outlier if it's > 5 min from its nearest neighbor.
-        (Phase 4 uses a different definition: > 2x average distance)
+        (Phase 4 uses a different definition: > 1.5x average distance)
         """
         if len(dogs) < 2:
             return []
@@ -1176,14 +1355,14 @@ class DogReassignmentSystem:
         
         return close_options[0] if close_options else best_options[0]
 
-    def phase5_balance_driver_workload(self):
-        """PHASE 5 (was 4): Balance workload between drivers to even out dog counts
+    def phase7_balance_driver_workload(self):
+        """PHASE 7 (was 6): Balance workload between drivers to even out dog counts
         
         Moves dogs from overloaded to underloaded drivers.
         Only moves if it adds ≤ 2 minutes to the route.
         Dogs stay in their assigned groups (1, 2, 3).
         """
-        print("\n⚖️ PHASE 5: Balancing driver workloads")
+        print("\n⚖️ PHASE 7: Balancing driver workloads")
         print("=" * 60)
         
         # Calculate current capacity for each driver
