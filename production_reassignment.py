@@ -56,6 +56,7 @@ except ImportError as e:
     print("💡 Install with: pip install gspread oauth2client requests scikit-learn numpy")
     sys.exit(1)
 
+
 @dataclass
 class Dog:
     """Represents a dog with its requirements"""
@@ -68,6 +69,7 @@ class Dog:
     
     def needs_group(self, group_num: int) -> bool:
         return group_num in self.groups_needed
+
 
 @dataclass
 class RouteChain:
@@ -98,6 +100,7 @@ class RouteChain:
     @property
     def has_all_groups(self) -> bool:
         return len(self.group1_dogs) > 0 and len(self.group2_dogs) > 0 and len(self.group3_dogs) > 0
+
 
 class ChainBasedClusteringSystem:
     def __init__(self):
@@ -416,175 +419,6 @@ class ChainBasedClusteringSystem:
             print(f"⚠️  Error calculating distance: {e}")
             return float('inf')
     
-    def consolidate_small_groups(self, chains: List[RouteChain]) -> List[RouteChain]:
-        """Consolidate groups with less than minimum size (4 dogs)"""
-        print(f"\n🔄 Consolidating groups with < {self.MIN_GROUP_SIZE} dogs...")
-        
-        changes_made = True
-        consolidation_count = 0
-        
-        while changes_made:
-            changes_made = False
-            
-            for chain_idx, chain in enumerate(chains):
-                if not chain:  # Skip empty chains
-                    continue
-                
-                # Count dogs in each group
-                g1_count = len(chain.group1_dogs)
-                g2_count = len(chain.group2_dogs)
-                g3_count = len(chain.group3_dogs)
-                
-                # Don't consolidate if it would leave driver with no groups
-                if groups_count <= 1:
-                    continue
-                
-                # Special check: Figure out which groups would remain after consolidation
-                remaining_groups = []
-                if g1_count >= self.MIN_GROUP_SIZE:
-                    remaining_groups.append(1)
-                if g2_count >= self.MIN_GROUP_SIZE:
-                    remaining_groups.append(2)
-                if g3_count >= self.MIN_GROUP_SIZE:
-                    remaining_groups.append(3)
-                
-                # Don't consolidate if it would leave only Group 2
-                if remaining_groups == [2]:
-                    print(f"   ⚠️  Cannot consolidate {chain.driver_id} - would leave only Group 2")
-                    continue
-                
-                # Check each group for consolidation
-                for group_num, group_dogs, group_name in [
-                    (1, chain.group1_dogs, "Group 1"),
-                    (2, chain.group2_dogs, "Group 2"),
-                    (3, chain.group3_dogs, "Group 3")
-                ]:
-                    if 0 < len(group_dogs) < self.MIN_GROUP_SIZE:
-                        print(f"\n   ⚠️  {chain.driver_id} {group_name} has only {len(group_dogs)} dogs")
-                        
-                        # Find best alternative placement for each dog
-                        dogs_to_move = group_dogs.copy()
-                        successfully_moved = []
-                        
-                        for dog in dogs_to_move:
-                        # Ensure we have a valid dog name for error handling
-                        if dog and hasattr(dog, 'name'):
-                            dog_name = dog.name
-                        else:
-                            dog_name = f"Dog_{dog.dog_id if dog and hasattr(dog, 'dog_id') else 'Unknown'}"
-                            best_chain = None
-                            best_distance = float('inf')
-                            
-                            # Look for another chain with this group that has capacity
-                            for other_idx, other_chain in enumerate(chains):
-                                if other_idx == chain_idx or not other_chain:
-                                    continue
-                                
-                                # Get the appropriate group from other chain
-                                if group_num == 1:
-                                    other_group_dogs = other_chain.group1_dogs
-                                elif group_num == 2:
-                                    other_group_dogs = other_chain.group2_dogs
-                                else:
-                                    other_group_dogs = other_chain.group3_dogs
-                                
-                                # Skip if other chain doesn't have this group
-                                if len(other_group_dogs) == 0:
-                                    continue
-                                
-                                # Check capacity
-                                other_chain_density = self.calculate_chain_density(other_chain)
-                                capacity = self.DENSE_CAPACITY if other_chain_density < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
-                                
-                                if len(other_group_dogs) >= capacity:
-                                    continue
-                                
-                                # Calculate average distance to dogs in this group
-                                total_dist = 0
-                                for other_dog in other_group_dogs[:5]:  # Sample for efficiency
-                                    total_dist += self.get_distance(dog, other_dog)
-                                
-                                avg_dist = total_dist / min(5, len(other_group_dogs))
-                                
-                                if avg_dist < best_distance:
-                                    best_distance = avg_dist
-                                    best_chain = other_chain
-                            
-                            # Ensure we have a valid dog name
-                            dog_name = dog.name if hasattr(dog, 'name') else 'Unknown'
-                            
-                            # Move dog to best chain if found
-                            if best_chain and best_distance < 10.0:
-                                if group_num == 1:
-                                    best_chain.group1_dogs.append(dog)
-                                elif group_num == 2:
-                                    best_chain.group2_dogs.append(dog)
-                                else:
-                                    best_chain.group3_dogs.append(dog)
-                                
-                                successfully_moved.append(dog)
-                                print(f"      ✅ Moved {dog_name} to {best_chain.driver_id} ({best_distance:.1f}min)")
-                            else:
-                                print(f"      ❌ Could not find good placement for {dog_name}")
-                        
-                        # Remove successfully moved dogs from original chain
-                        if successfully_moved:
-                            if group_num == 1:
-                                chain.group1_dogs = [d for d in chain.group1_dogs if d not in successfully_moved]
-                            elif group_num == 2:
-                                chain.group2_dogs = [d for d in chain.group2_dogs if d not in successfully_moved]
-                            else:
-                                chain.group3_dogs = [d for d in chain.group3_dogs if d not in successfully_moved]
-                            
-                            consolidation_count += len(successfully_moved)
-                            changes_made = True
-                            break  # Re-evaluate this chain
-        
-        # Remove empty chains
-        chains = [c for c in chains if c and (c.group1_dogs or c.group2_dogs or c.group3_dogs)]
-        
-        # Renumber chains
-        for idx, chain in enumerate(chains):
-            chain.driver_id = f"Driver_{idx + 1:02d}"
-        
-        print(f"\n✅ Consolidation complete: {consolidation_count} dogs moved")
-        return chains
-    
-    def calculate_chain_density(self, chain: RouteChain) -> float:
-        """Calculate average distance within a chain to determine if it's dense"""
-        if not chain:
-            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
-            
-        all_dogs = []
-        seen_ids = set()
-        
-        # Safely collect all unique dogs
-        for dog in (chain.group1_dogs or []) + (chain.group2_dogs or []) + (chain.group3_dogs or []):
-            if dog and dog.dog_id not in seen_ids:
-                all_dogs.append(dog)
-                seen_ids.add(dog.dog_id)
-        
-        if len(all_dogs) < 2:
-            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
-        
-        # Sample distances to avoid O(n²) for large groups
-        distances = []
-        sample_size = min(10, len(all_dogs))
-        
-        for i in range(sample_size):
-            for j in range(i + 1, sample_size):
-                try:
-                    dist = self.get_distance(all_dogs[i], all_dogs[j])
-                    if dist < float('inf'):
-                        distances.append(dist)
-                except Exception:
-                    continue
-        
-        if distances:
-            return sum(distances) / len(distances)
-        else:
-            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
-    
     def build_transition_aware_chains(self):
         """Build route chains considering G1→G2 and G2→G3 transitions"""
         print("\n🔗 Building transition-aware chains...")
@@ -629,6 +463,8 @@ class ChainBasedClusteringSystem:
             if not g2_cluster:
                 continue
             
+            print(f"\n🔍 Processing G2 cluster {cluster_idx + 1} ({len(g2_cluster)} dogs)")
+            
             # Determine capacity based on cluster density
             # Calculate average distance within G2 cluster to determine if it's dense
             if len(g2_cluster) > 1:
@@ -648,7 +484,6 @@ class ChainBasedClusteringSystem:
             else:
                 capacity = self.STANDARD_CAPACITY
             
-            print(f"\n🔍 Processing G2 cluster {cluster_idx + 1} ({len(g2_cluster)} dogs)")
             print(f"   Capacity: {capacity} dogs per group ({'DENSE' if capacity == self.DENSE_CAPACITY else 'STANDARD'} route)")
             
             # Ensure G2 cluster itself doesn't exceed capacity
@@ -812,101 +647,6 @@ class ChainBasedClusteringSystem:
                     chains.append(chain)
         
         return chains
-    
-    def handle_remaining_dogs(self, chains: List[RouteChain], remaining_dogs: List[Dog], used_dogs: Set[str]):
-        """Handle dogs that weren't assigned in the initial clustering"""
-        print("\n🔧 Handling remaining dogs...")
-        
-        for dog in remaining_dogs:
-            best_chain = None
-            best_score = float('inf')
-            
-            # Find best existing chain for this dog
-            for chain in chains:
-                # Calculate route density to determine capacity
-                all_chain_dogs = list(set(chain.group1_dogs + chain.group2_dogs + chain.group3_dogs))
-                if len(all_chain_dogs) > 1:
-                    distances = []
-                    for i in range(min(5, len(all_chain_dogs))):
-                        for j in range(i + 1, min(5, len(all_chain_dogs))):
-                            dist = self.get_distance(all_chain_dogs[i], all_chain_dogs[j])
-                            if dist < float('inf'):
-                                distances.append(dist)
-                    
-                    if distances:
-                        avg_distance = sum(distances) / len(distances)
-                        capacity = self.DENSE_CAPACITY if avg_distance < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
-                    else:
-                        capacity = self.STANDARD_CAPACITY
-                else:
-                    capacity = self.STANDARD_CAPACITY
-                
-                # Check if chain has room for this dog in the groups it needs
-                can_add_to_g1 = dog.needs_group(1) and len(chain.group1_dogs) < capacity
-                can_add_to_g2 = dog.needs_group(2) and len(chain.group2_dogs) < capacity
-                can_add_to_g3 = dog.needs_group(3) and len(chain.group3_dogs) < capacity
-                
-                # Dog must be able to fit in ALL groups it needs
-                can_add = True
-                if dog.needs_group(1) and not can_add_to_g1:
-                    can_add = False
-                if dog.needs_group(2) and not can_add_to_g2:
-                    can_add = False
-                if dog.needs_group(3) and not can_add_to_g3:
-                    can_add = False
-                
-                if not can_add:
-                    continue
-                
-                # Calculate average distance to relevant groups
-                total_distance = 0
-                count = 0
-                
-                if dog.needs_group(1) and chain.group1_dogs:
-                    for other_dog in chain.group1_dogs[:5]:  # Check first 5 for efficiency
-                        total_distance += self.get_distance(dog, other_dog)
-                        count += 1
-                
-                if dog.needs_group(2) and chain.group2_dogs:
-                    for other_dog in chain.group2_dogs[:5]:
-                        total_distance += self.get_distance(dog, other_dog)
-                        count += 1
-                
-                if dog.needs_group(3) and chain.group3_dogs:
-                    for other_dog in chain.group3_dogs[:5]:
-                        total_distance += self.get_distance(dog, other_dog)
-                        count += 1
-                
-                if count > 0:
-                    avg_distance = total_distance / count
-                    if avg_distance < best_score:
-                        best_score = avg_distance
-                        best_chain = chain
-            
-            # Add to best chain
-            if best_chain and best_score < 10.0:  # Only if reasonably close
-                if dog.needs_group(1):
-                    best_chain.group1_dogs.append(dog)
-                if dog.needs_group(2):
-                    best_chain.group2_dogs.append(dog)
-                if dog.needs_group(3):
-                    best_chain.group3_dogs.append(dog)
-                
-                used_dogs.add(dog.dog_id)
-                print(f"   ✅ Added {dog.name} to {best_chain.driver_id} (distance: {best_score:.1f}min)")
-            else:
-                # Create new chain if no suitable existing chain
-                if best_score >= 10.0 or best_chain is None:
-                    new_chain_idx = len(chains) + 1
-                    new_chain = RouteChain(
-                        driver_id=f"Driver_{new_chain_idx:02d}",
-                        group1_dogs=[dog] if dog.needs_group(1) else [],
-                        group2_dogs=[dog] if dog.needs_group(2) else [],
-                        group3_dogs=[dog] if dog.needs_group(3) else []
-                    )
-                    chains.append(new_chain)
-                    used_dogs.add(dog.dog_id)
-                    print(f"   ✅ Created new chain {new_chain.driver_id} for {dog.name}")
     
     def cluster_dogs_with_capacity(self, dogs: List[Dog], eps_minutes: float = 2.0) -> List[List[Dog]]:
         """Cluster dogs using DBSCAN with capacity limits"""
@@ -1104,6 +844,328 @@ class ChainBasedClusteringSystem:
         
         return total_distance / count if count > 0 else 0.0
     
+    def handle_remaining_dogs(self, chains: List[RouteChain], remaining_dogs: List[Dog], used_dogs: Set[str]):
+        """Handle dogs that weren't assigned in the initial clustering"""
+        if not remaining_dogs:
+            return
+            
+        print("\n🔧 Handling remaining dogs...")
+        
+        dogs_handled = 0
+        
+        for dog in remaining_dogs:
+            if not dog or not hasattr(dog, 'dog_id'):
+                continue
+                
+            # Skip if already used (safety check)
+            if dog.dog_id in used_dogs:
+                continue
+                
+            best_chain = None
+            best_score = float('inf')
+            
+            # Find best existing chain for this dog
+            for chain in chains:
+                if not chain:
+                    continue
+                    
+                # Calculate route density to determine capacity
+                all_chain_dogs = []
+                for d in (chain.group1_dogs or []) + (chain.group2_dogs or []) + (chain.group3_dogs or []):
+                    if d and d.dog_id not in [existing.dog_id for existing in all_chain_dogs]:
+                        all_chain_dogs.append(d)
+                
+                if len(all_chain_dogs) > 1:
+                    distances = []
+                    sample_size = min(5, len(all_chain_dogs))
+                    for i in range(sample_size):
+                        for j in range(i + 1, sample_size):
+                            dist = self.get_distance(all_chain_dogs[i], all_chain_dogs[j])
+                            if 0 <= dist < float('inf'):
+                                distances.append(dist)
+                    
+                    if distances:
+                        avg_distance = sum(distances) / len(distances)
+                        capacity = self.DENSE_CAPACITY if avg_distance < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
+                    else:
+                        capacity = self.STANDARD_CAPACITY
+                else:
+                    capacity = self.STANDARD_CAPACITY
+                
+                # Check if chain has room for this dog in the groups it needs
+                can_add = True
+                for group_num in dog.groups_needed:
+                    if group_num == 1:
+                        current_count = len(chain.group1_dogs) if chain.group1_dogs else 0
+                        if current_count >= capacity:
+                            can_add = False
+                            break
+                    elif group_num == 2:
+                        current_count = len(chain.group2_dogs) if chain.group2_dogs else 0
+                        if current_count >= capacity:
+                            can_add = False
+                            break
+                    elif group_num == 3:
+                        current_count = len(chain.group3_dogs) if chain.group3_dogs else 0
+                        if current_count >= capacity:
+                            can_add = False
+                            break
+                
+                if not can_add:
+                    continue
+                
+                # Calculate average distance to relevant groups
+                total_distance = 0
+                count = 0
+                
+                if dog.needs_group(1) and chain.group1_dogs:
+                    for other_dog in chain.group1_dogs[:5]:  # Check first 5 for efficiency
+                        dist = self.get_distance(dog, other_dog)
+                        if 0 <= dist < float('inf'):
+                            total_distance += dist
+                            count += 1
+                
+                if dog.needs_group(2) and chain.group2_dogs:
+                    for other_dog in chain.group2_dogs[:5]:
+                        dist = self.get_distance(dog, other_dog)
+                        if 0 <= dist < float('inf'):
+                            total_distance += dist
+                            count += 1
+                
+                if dog.needs_group(3) and chain.group3_dogs:
+                    for other_dog in chain.group3_dogs[:5]:
+                        dist = self.get_distance(dog, other_dog)
+                        if 0 <= dist < float('inf'):
+                            total_distance += dist
+                            count += 1
+                
+                if count > 0:
+                    avg_distance = total_distance / count
+                    if avg_distance < best_score:
+                        best_score = avg_distance
+                        best_chain = chain
+            
+            # Add to best chain or create new one
+            dog_name = dog.name if hasattr(dog, 'name') else dog.dog_id
+            
+            if best_chain and best_score < 10.0:  # Only if reasonably close
+                if dog.needs_group(1):
+                    best_chain.group1_dogs.append(dog)
+                if dog.needs_group(2):
+                    best_chain.group2_dogs.append(dog)
+                if dog.needs_group(3):
+                    best_chain.group3_dogs.append(dog)
+                
+                used_dogs.add(dog.dog_id)
+                dogs_handled += 1
+                print(f"   ✅ Added {dog_name} to {best_chain.driver_id} (distance: {best_score:.1f}min)")
+            else:
+                # Create new chain if no suitable existing chain
+                new_chain_idx = len(chains) + 1
+                new_chain = RouteChain(
+                    driver_id=f"Driver_{new_chain_idx:02d}",
+                    group1_dogs=[dog] if dog.needs_group(1) else [],
+                    group2_dogs=[dog] if dog.needs_group(2) else [],
+                    group3_dogs=[dog] if dog.needs_group(3) else []
+                )
+                chains.append(new_chain)
+                used_dogs.add(dog.dog_id)
+                dogs_handled += 1
+                print(f"   ✅ Created new chain {new_chain.driver_id} for {dog_name}")
+        
+        print(f"   Handled {dogs_handled} remaining dogs")
+    
+    def consolidate_small_groups(self, chains: List[RouteChain]) -> List[RouteChain]:
+        """Consolidate groups with less than minimum size (4 dogs)"""
+        print(f"\n🔄 Consolidating groups with < {self.MIN_GROUP_SIZE} dogs...")
+        
+        if not chains:
+            print("   No chains to consolidate")
+            return chains
+        
+        changes_made = True
+        consolidation_count = 0
+        iterations = 0
+        
+        while changes_made and iterations < self.MAX_CONSOLIDATION_ITERATIONS:
+            changes_made = False
+            iterations += 1
+            
+            for chain_idx, chain in enumerate(chains):
+                if not chain:  # Skip empty chains
+                    continue
+                
+                # Count dogs in each group
+                g1_count = len(chain.group1_dogs) if chain.group1_dogs else 0
+                g2_count = len(chain.group2_dogs) if chain.group2_dogs else 0
+                g3_count = len(chain.group3_dogs) if chain.group3_dogs else 0
+                
+                # Count how many groups this driver has
+                groups_count = sum([g1_count > 0, g2_count > 0, g3_count > 0])
+                
+                # Don't consolidate if it would leave driver with no groups
+                if groups_count <= 1:
+                    continue
+                
+                # Special check: Figure out which groups would remain after consolidation
+                remaining_groups = []
+                small_groups = []
+                
+                if g1_count >= self.MIN_GROUP_SIZE:
+                    remaining_groups.append(1)
+                elif 0 < g1_count < self.MIN_GROUP_SIZE:
+                    small_groups.append((1, chain.group1_dogs[:], "Group 1"))  # Copy list
+                    
+                if g2_count >= self.MIN_GROUP_SIZE:
+                    remaining_groups.append(2)
+                elif 0 < g2_count < self.MIN_GROUP_SIZE:
+                    small_groups.append((2, chain.group2_dogs[:], "Group 2"))  # Copy list
+                    
+                if g3_count >= self.MIN_GROUP_SIZE:
+                    remaining_groups.append(3)
+                elif 0 < g3_count < self.MIN_GROUP_SIZE:
+                    small_groups.append((3, chain.group3_dogs[:], "Group 3"))  # Copy list
+                
+                # Don't consolidate if it would leave only Group 2
+                if remaining_groups == [2]:
+                    print(f"   ⚠️  Cannot consolidate {chain.driver_id} - would leave only Group 2")
+                    continue
+                
+                # Process small groups
+                for group_num, group_dogs, group_name in small_groups:
+                    if not group_dogs:  # Safety check
+                        continue
+                        
+                    print(f"\n   ⚠️  {chain.driver_id} {group_name} has only {len(group_dogs)} dogs")
+                    
+                    # Find best alternative placement for each dog
+                    dogs_to_move = group_dogs.copy()
+                    successfully_moved = []
+                    
+                    for dog in dogs_to_move:
+                        # Ensure we have a valid dog name for error handling
+                        if dog and hasattr(dog, 'name'):
+                            dog_name = dog.name
+                        else:
+                            dog_name = f"Dog_{dog.dog_id if dog and hasattr(dog, 'dog_id') else 'Unknown'}"
+                        
+                        best_chain = None
+                        best_distance = float('inf')
+                        
+                        # Look for another chain with this group that has capacity
+                        for other_idx, other_chain in enumerate(chains):
+                            if other_idx == chain_idx or not other_chain:
+                                continue
+                            
+                            # Get the appropriate group from other chain
+                            if group_num == 1:
+                                other_group_dogs = other_chain.group1_dogs if other_chain.group1_dogs else []
+                            elif group_num == 2:
+                                other_group_dogs = other_chain.group2_dogs if other_chain.group2_dogs else []
+                            else:
+                                other_group_dogs = other_chain.group3_dogs if other_chain.group3_dogs else []
+                            
+                            # Skip if other chain doesn't have this group
+                            if len(other_group_dogs) == 0:
+                                continue
+                            
+                            # Check capacity
+                            other_chain_density = self.calculate_chain_density(other_chain)
+                            capacity = self.DENSE_CAPACITY if other_chain_density < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
+                            
+                            if len(other_group_dogs) >= capacity:
+                                continue
+                            
+                            # Calculate average distance to dogs in this group
+                            total_dist = 0
+                            count = 0
+                            for other_dog in other_group_dogs[:5]:  # Sample for efficiency
+                                dist = self.get_distance(dog, other_dog)
+                                if dist < float('inf'):
+                                    total_dist += dist
+                                    count += 1
+                            
+                            if count > 0:
+                                avg_dist = total_dist / count
+                                if avg_dist < best_distance:
+                                    best_distance = avg_dist
+                                    best_chain = other_chain
+                        
+                        # Move dog to best chain if found
+                        if best_chain and best_distance < 10.0:
+                            if group_num == 1:
+                                best_chain.group1_dogs.append(dog)
+                            elif group_num == 2:
+                                best_chain.group2_dogs.append(dog)
+                            else:
+                                best_chain.group3_dogs.append(dog)
+                            
+                            successfully_moved.append(dog)
+                            print(f"      ✅ Moved {dog_name} to {best_chain.driver_id} ({best_distance:.1f}min)")
+                        else:
+                            print(f"      ❌ Could not find good placement for {dog_name}")
+                    
+                    # Remove successfully moved dogs from original chain
+                    if successfully_moved:
+                        if group_num == 1:
+                            chain.group1_dogs = [d for d in chain.group1_dogs if d not in successfully_moved]
+                        elif group_num == 2:
+                            chain.group2_dogs = [d for d in chain.group2_dogs if d not in successfully_moved]
+                        else:
+                            chain.group3_dogs = [d for d in chain.group3_dogs if d not in successfully_moved]
+                        
+                        consolidation_count += len(successfully_moved)
+                        changes_made = True
+                        break  # Re-evaluate this chain
+        
+        # Remove empty chains
+        chains = [c for c in chains if c and (c.group1_dogs or c.group2_dogs or c.group3_dogs)]
+        
+        # Renumber chains
+        for idx, chain in enumerate(chains):
+            chain.driver_id = f"Driver_{idx + 1:02d}"
+        
+        if iterations >= self.MAX_CONSOLIDATION_ITERATIONS:
+            print(f"\n⚠️  Reached maximum consolidation iterations ({self.MAX_CONSOLIDATION_ITERATIONS})")
+        
+        print(f"\n✅ Consolidation complete: {consolidation_count} dogs moved")
+        return chains
+    
+    def calculate_chain_density(self, chain: RouteChain) -> float:
+        """Calculate average distance within a chain to determine if it's dense"""
+        if not chain:
+            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
+            
+        all_dogs = []
+        seen_ids = set()
+        
+        # Safely collect all unique dogs
+        for dog in (chain.group1_dogs or []) + (chain.group2_dogs or []) + (chain.group3_dogs or []):
+            if dog and dog.dog_id not in seen_ids:
+                all_dogs.append(dog)
+                seen_ids.add(dog.dog_id)
+        
+        if len(all_dogs) < 2:
+            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
+        
+        # Sample distances to avoid O(n²) for large groups
+        distances = []
+        sample_size = min(10, len(all_dogs))
+        
+        for i in range(sample_size):
+            for j in range(i + 1, sample_size):
+                try:
+                    dist = self.get_distance(all_dogs[i], all_dogs[j])
+                    if dist < float('inf'):
+                        distances.append(dist)
+                except Exception:
+                    continue
+        
+        if distances:
+            return sum(distances) / len(distances)
+        else:
+            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
+    
     def optimize_chains(self, chains: List[RouteChain]) -> List[RouteChain]:
         """Optimize chains for balance and efficiency"""
         print("\n⚖️  Optimizing chains for balance...")
@@ -1134,29 +1196,46 @@ class ChainBasedClusteringSystem:
         """Generate final assignments in format needed for Google Sheets"""
         assignments = {}
         
+        if not self.routes:
+            print("⚠️  No routes to generate assignments from")
+            return assignments
+        
         for chain in self.routes:
+            if not chain:  # Skip None/empty chains
+                continue
+                
             # Track which dogs we've already assigned for this driver
             assigned_for_driver = set()
             
             # Collect all unique dogs in this chain
             all_chain_dogs = {}  # dog_id -> dog object
             
-            for dog in chain.group1_dogs:
-                all_chain_dogs[dog.dog_id] = dog
-            for dog in chain.group2_dogs:
-                all_chain_dogs[dog.dog_id] = dog
-            for dog in chain.group3_dogs:
-                all_chain_dogs[dog.dog_id] = dog
+            for dog in (chain.group1_dogs or []):
+                if dog and hasattr(dog, 'dog_id'):
+                    all_chain_dogs[dog.dog_id] = dog
+                    
+            for dog in (chain.group2_dogs or []):
+                if dog and hasattr(dog, 'dog_id'):
+                    all_chain_dogs[dog.dog_id] = dog
+                    
+            for dog in (chain.group3_dogs or []):
+                if dog and hasattr(dog, 'dog_id'):
+                    all_chain_dogs[dog.dog_id] = dog
             
             # Create assignment for each unique dog
             for dog_id, dog in all_chain_dogs.items():
+                if not dog_id or dog_id in assigned_for_driver:
+                    continue
+                    
                 # Build the group string from dog's original needs
-                group_parts = [str(g) for g in sorted(dog.groups_needed)]
-                group_string = ''.join(group_parts)
+                group_string = ''.join(str(g) for g in sorted(dog.groups_needed))
                 
+                # Format: Driver_01:123 or Driver_02:1 etc
                 assignment = f"{chain.driver_id}:{group_string}"
                 assignments[dog_id] = assignment
+                assigned_for_driver.add(dog_id)
         
+        print(f"📋 Generated {len(assignments)} assignments")
         return assignments
     
     def analyze_results(self):
@@ -1392,6 +1471,7 @@ class ChainBasedClusteringSystem:
             import traceback
             traceback.print_exc()
 
+
 def main():
     """Main entry point"""
     try:
@@ -1439,6 +1519,7 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
