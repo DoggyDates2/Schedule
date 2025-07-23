@@ -1,9 +1,8 @@
-name: Run Optimization
+name: Run Dog Optimization V2
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
 
 jobs:
   run:
@@ -13,4 +12,32 @@ jobs:
     - run: |
         pip install gspread oauth2client requests
         echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
-        python production_reassignment.py
+        
+        # Add rate limiting fix
+        cat >> rate_limit_fix.py << 'EOF'
+        import time
+        
+        # Monkey patch the batch_update to add rate limiting
+        original_batch_update = None
+        
+        def rate_limited_batch_update(self, updates):
+            BATCH_SIZE = 50
+            for i in range(0, len(updates), BATCH_SIZE):
+                batch = updates[i:i + BATCH_SIZE]
+                try:
+                    original_batch_update(batch)
+                    if i + BATCH_SIZE < len(updates):
+                        time.sleep(1)  # Pause between batches
+                except Exception as e:
+                    if "429" in str(e):
+                        print("Rate limit hit, waiting 60s...")
+                        time.sleep(60)
+                        original_batch_update(batch)
+        
+        import gspread
+        original_batch_update = gspread.Worksheet.batch_update
+        gspread.Worksheet.batch_update = rate_limited_batch_update
+        EOF
+        
+        # Run with rate limiting
+        python -c "exec(open('rate_limit_fix.py').read()); exec(open('production_reassignment.py').read())"
