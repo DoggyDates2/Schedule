@@ -1,43 +1,152 @@
-name: Run Dog Optimization V2
+name: Dog Optimization - Memory First
 
 on:
   workflow_dispatch:
   push:
+    branches: [ main ]
 
 jobs:
-  run:
+  optimize:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    - run: |
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
         pip install gspread oauth2client requests
-        echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+    
+    - name: Run optimization with batch updates
+      env:
+        CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+      run: |
+        # Create credentials file
+        echo "$CREDENTIALS" > credentials.json
         
-        # Add rate limiting fix
-        cat >> rate_limit_fix.py << 'EOF'
+        # Create a wrapper script that disables individual updates
+        cat > optimize_wrapper.py << 'WRAPPER'
+        import sys
         import time
         
-        # Monkey patch the batch_update to add rate limiting
-        original_batch_update = None
+        # Import the optimization system
+        from production_reassignment import DogReassignmentSystem
         
-        def rate_limited_batch_update(self, updates):
-            BATCH_SIZE = 50
-            for i in range(0, len(updates), BATCH_SIZE):
-                batch = updates[i:i + BATCH_SIZE]
+        # Override the individual update method to do nothing
+        class BatchedDogReassignmentSystem(DogReassignmentSystem):
+            def __init__(self):
+                super().__init__()
+                self.pending_updates = []  # Store updates instead of applying immediately
+                
+            def _update_assignment_on_sheet(self, dog_data):
+                """Store update for later instead of updating immediately"""
+                # Just store it, don't actually update
+                print(f"   📝 Queued update for {dog_data.get('dog_name', 'Unknown')}")
+                return  # Do nothing - we'll batch update at the end
+            
+            def write_results_to_sheets(self):
+                """Batch update all results at once with rate limiting"""
+                print("\n💾 Saving all results to Google Sheets in batches...")
+                
                 try:
-                    original_batch_update(batch)
-                    if i + BATCH_SIZE < len(updates):
-                        time.sleep(1)  # Pause between batches
+                    # Prepare all updates
+                    all_updates = []
+                    combined_col_idx = 8  # Column H
+                    
+                    for assignment in self.dog_assignments:
+                        if isinstance(assignment, dict) and 'row_index' in assignment:
+                            row_idx = assignment['row_index']
+                            combined_value = assignment.get('combined', '')
+                            
+                            # Create cell reference
+                            col_letter = chr(ord('A') + combined_col_idx - 1) if combined_col_idx <= 26 else 'H'
+                            cell_ref = f"{col_letter}{row_idx}"
+                            
+                            all_updates.append({
+                                'range': cell_ref,
+                                'values': [[combined_value]]
+                            })
+                    
+                    print(f"📊 Total updates to make: {len(all_updates)}")
+                    
+                    # Process in batches of 50 to avoid rate limits
+                    BATCH_SIZE = 50
+                    total_updated = 0
+                    
+                    for i in range(0, len(all_updates), BATCH_SIZE):
+                        batch = all_updates[i:i + BATCH_SIZE]
+                        batch_num = (i // BATCH_SIZE) + 1
+                        total_batches = (len(all_updates) + BATCH_SIZE - 1) // BATCH_SIZE
+                        
+                        try:
+                            print(f"\n📦 Batch {batch_num}/{total_batches}: Updating {len(batch)} cells...")
+                            self.map_sheet.batch_update(batch)
+                            total_updated += len(batch)
+                            
+                            # Progress
+                            progress = (total_updated / len(all_updates)) * 100
+                            print(f"   ✅ Progress: {total_updated}/{len(all_updates)} ({progress:.1f}%)")
+                            
+                            # Rate limiting between batches
+                            if i + BATCH_SIZE < len(all_updates):
+                                print("   ⏳ Pausing 2 seconds between batches...")
+                                time.sleep(2)
+                                
+                        except Exception as e:
+                            if "429" in str(e) or "quota" in str(e).lower():
+                                print("   ⚠️ Rate limit reached. Waiting 60 seconds...")
+                                time.sleep(60)
+                                
+                                # Retry this batch
+                                try:
+                                    self.map_sheet.batch_update(batch)
+                                    total_updated += len(batch)
+                                    print("   ✅ Retry successful!")
+                                except Exception as retry_error:
+                                    print(f"   ❌ Batch {batch_num} failed after retry: {retry_error}")
+                            else:
+                                print(f"   ❌ Batch {batch_num} error: {e}")
+                    
+                    print(f"\n✅ Successfully saved {total_updated}/{len(all_updates)} assignments to Google Sheets!")
+                    
                 except Exception as e:
-                    if "429" in str(e):
-                        print("Rate limit hit, waiting 60s...")
-                        time.sleep(60)
-                        original_batch_update(batch)
+                    print(f"❌ Error during batch save: {e}")
         
-        import gspread
-        original_batch_update = gspread.Worksheet.batch_update
-        gspread.Worksheet.batch_update = rate_limited_batch_update
-        EOF
+        # Fix worksheet names
+        def fix_worksheet_names():
+            import fileinput
+            import sys
+            
+            for line in fileinput.input('production_reassignment.py', inplace=True):
+                line = line.replace('worksheet("Map 4")', 'worksheet("Map")')
+                line = line.replace('worksheet("Matrix 15")', 'worksheet("Matrix")')
+                sys.stdout.write(line)
         
-        # Run with rate limiting
-        python -c "exec(open('rate_limit_fix.py').read()); exec(open('production_reassignment.py').read())"
+        # Fix the worksheet names
+        fix_worksheet_names()
+        
+        # Run the optimization with batched updates
+        print("=" * 60)
+        print("🚀 DOG ROUTE OPTIMIZATION - BATCH MODE")
+        print("=" * 60)
+        print("ℹ️  All updates will be saved at the end to avoid rate limits")
+        print()
+        
+        system = BatchedDogReassignmentSystem()
+        success = system.run()
+        
+        if success:
+            print("\n🎉 Optimization complete! Check your Google Sheets for results.")
+        else:
+            sys.exit(1)
+        WRAPPER
+        
+        # Run the wrapper
+        python optimize_wrapper.py
+        
+        # Clean up
+        rm -f credentials.json
