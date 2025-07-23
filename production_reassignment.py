@@ -1,45 +1,36 @@
 #!/usr/bin/env python3
 """
-Dog Assignment Optimization System - TIME-BASED (MINUTES)
+Chain-Based Dog Clustering System
 
-UPDATE: Now 7 phases with improved outlier detection and smarter group consolidation.
-- Outliers: Dogs > 1.5x average OR > 3 min from average OR > 3 min from nearest neighbor
-- Small groups: Each dog moved to its closest individual neighbor
-- Phase 6: Uses nearest neighbor approach to preserve route efficiency
+A fresh approach that builds optimal pickup/dropoff chains from scratch.
+Instead of fighting existing assignments, we create ideal routes considering:
+- Group 1 dropoff → Group 2 pickup transitions
+- Group 2 dropoff → Group 3 pickup transitions
 
-OPTIMIZATION STRATEGY (7 PHASES):
-1. Phase 1: Assign ALL callout dogs to closest driver (ignore capacity)
-2. Phase 2: Consolidate drivers with < 12 total dogs (give them day off)
-3. Phase 3: Cluster nearby dogs (< 1 min apart) to same driver
-   - Creates natural clusters for efficiency
-   - Handles chains: if A near B and B near C, all go together
-4. Phase 4: Remove outliers from ALL groups
-   - Multiple criteria: > 1.5x avg, > 3 min absolute, > 3 min from nearest
-   - Evaluates every group, not just over-capacity ones
-   - Moves outliers to closest group regardless of capacity
-5. Phase 5: Consolidate small groups (Group 1 or 3 with < 4 dogs)
-   - Only if driver has all 3 groups
-   - Never leaves driver with just one group
-   - Each dog moves to its closest individual neighbor
-6. Phase 6: Balance capacity by moving dogs with worst connectivity
-   - Uses nearest neighbor approach to preserve route chains
-   - Moves isolated dogs first (high min distance to nearest neighbor)
-7. Phase 7: Balance workloads between drivers (max 2 min added time)
-   - Even out dog counts across drivers
+DATA SETUP:
+1. In your Map sheet, mark every dog's groups in the Callout column (K):
+   - :1 (just group 1)
+   - :23 (groups 2 and 3)  
+   - :123 (all three groups)
+2. Leave the Combined column (H) completely blank
+3. Run this script - it will fill Combined with optimized assignments:
+   - Driver_01:123
+   - Driver_02:1
+   - etc.
 
-KEY RULES:
-- Never leave a driver with only one group
-- Never eliminate Group 2 (would create dead time)
-- Dogs NEVER change groups (1, 2, 3) - only drivers
+CAPACITY RULES:
+- Each group (G1, G2, G3) has its own capacity limit
+- Dense routes (avg < 2 min between dogs): 12 dogs per group
+- Standard routes: 8 dogs per group  
+- A driver might have: G1=12, G2=12, G3=12 (36 total) for dense routes
+- Or: G1=8, G2=8, G3=8 (24 total) for standard routes
 
-KEY CONCEPTS:
-- All distances now in MINUTES of driving time
-- Nearby dogs (< 1 min) should go to same driver for efficiency
-- Outliers = dogs > 1.5x average distance OR > 3 min from average
-- Also outliers: dogs > 3 min from nearest neighbor
-- Dense routes (avg < 2 min): capacity 12 dogs
-- Standard routes: capacity 8 dogs
-- Detour value: Must collect > 0.7 dogs/minute for detour to be worthwhile
+MINIMUM GROUP SIZE:
+- Each group must have at least 4 dogs to be worthwhile
+- Groups with < 4 dogs get consolidated to other drivers
+- This prevents paying drivers for tiny pickups/dropoffs
+
+MUCH simpler than the 7-phase approach!
 """
 
 import os
@@ -48,74 +39,95 @@ import json
 import time
 import math
 import logging
-import statistics
+import numpy as np
 from datetime import datetime
 from collections import defaultdict, Counter
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional, Set
 
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
     import requests
+    from sklearn.cluster import DBSCAN, KMeans
+    from sklearn.metrics.pairwise import pairwise_distances
 except ImportError as e:
     print(f"❌ Missing required library: {e}")
-    print("💡 Install with: pip install gspread oauth2client requests")
+    print("💡 Install with: pip install gspread oauth2client requests scikit-learn numpy")
     sys.exit(1)
 
-class DogReassignmentSystem:
+@dataclass
+class Dog:
+    """Represents a dog with its requirements"""
+    dog_id: str
+    name: str
+    lat: float
+    lng: float
+    groups_needed: List[int]  # [1], [2], [3], [1,2], [2,3], or [1,2,3]
+    address: str = ""
+    
+    def needs_group(self, group_num: int) -> bool:
+        return group_num in self.groups_needed
+
+@dataclass
+class RouteChain:
+    """Represents a complete route chain for a driver"""
+    driver_id: str
+    group1_dogs: List[Dog]
+    group2_dogs: List[Dog]
+    group3_dogs: List[Dog]
+    
+    def __post_init__(self):
+        """Ensure lists are never None"""
+        if self.group1_dogs is None:
+            self.group1_dogs = []
+        if self.group2_dogs is None:
+            self.group2_dogs = []
+        if self.group3_dogs is None:
+            self.group3_dogs = []
+    
+    @property
+    def total_dogs(self) -> int:
+        # Count unique dogs (some may appear in multiple groups)
+        all_dogs = set()
+        for dog in self.group1_dogs + self.group2_dogs + self.group3_dogs:
+            if dog:  # Safety check
+                all_dogs.add(dog.dog_id)
+        return len(all_dogs)
+    
+    @property
+    def has_all_groups(self) -> bool:
+        return len(self.group1_dogs) > 0 and len(self.group2_dogs) > 0 and len(self.group3_dogs) > 0
+
+class ChainBasedClusteringSystem:
     def __init__(self):
-        print("🚀 Enhanced Dog Reassignment System - TIME-BASED OPTIMIZATION")
-        print("   All distances are now in MINUTES of driving time")
-        print("   Dense routes (< 2 min avg): 12 dogs per group")
-        print("   Standard routes: 8 dogs per group")
-        print("   Small groups: < 4 dogs in Group 1 or 3 get consolidated")
-        print("   Outliers: Dogs > 1.5x avg OR > 3 min from neighbors")
-        print("   Clusters: Dogs < 1 min apart go to same driver")
-        print("   7-Phase optimization with aggressive outlier detection")
+        # Parameters (in minutes)
+        self.DENSE_THRESHOLD = 2.0  # Routes < 2 min avg get 12 dogs
+        self.STANDARD_CAPACITY = 8
+        self.DENSE_CAPACITY = 12
+        self.MIN_GROUP_SIZE = 4     # Minimum dogs to make a group worthwhile
+        self.MAX_ROUTE_SPAN = 10.0  # Maximum minutes across a route
+        self.TRANSITION_WEIGHT = 0.5  # How much G1→G2 and G2→G3 transitions matter
+        self.MAX_CONSOLIDATION_ITERATIONS = 10  # Prevent infinite loops
+        
+        print("🚀 Chain-Based Dog Clustering System")
+        print("   Building optimal routes from scratch!")
+        print("   Considering G1→G2 and G2→G3 transitions")
+        print(f"   Minimum {self.MIN_GROUP_SIZE} dogs per group (or group gets consolidated)")
+        print(f"   Capacity: Dense routes={self.DENSE_CAPACITY}, Standard={self.STANDARD_CAPACITY}")
         
         # Google Sheets IDs
         self.MAP_SHEET_ID = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
         self.DISTANCE_MATRIX_SHEET_ID = "1421xCS86YH6hx0RcuZCyXkyBK_xl-VDSlXyDNvw09Pg"
-        self.MAP_TAB = "Map"
-        self.MATRIX_TAB = "Matrix"
         
-        # System parameters - NOW IN MINUTES
-        self.PREFERRED_DISTANCE = 2      # 2 minutes preferred
-        self.MAX_DISTANCE = 5           # 5 minutes max for normal moves
-        self.ABSOLUTE_MAX_DISTANCE = 7  # 7 minutes = too far between dogs
-        self.DETOUR_THRESHOLD = 7       # 7 minutes detour acceptable
-        self.CASCADING_MOVE_MAX = 10    # 10 minutes for cascading moves
-        self.ADJACENT_GROUP_DISTANCE = 2 # 2 minutes between adjacent groups
-        self.EXCLUSION_DISTANCE = 100   # 100 minutes = placeholder for unreachable
-        self.DENSE_ROUTE_THRESHOLD = 2  # Routes denser than 2 min get capacity 12
-        self.OUTLIER_THRESHOLD = 5      # Dog is outlier if > 5 min from nearest neighbor
-        self.CLUSTER_THRESHOLD = 1      # Dogs < 1 min apart should cluster together
+        # Data storage
+        self.dogs: List[Dog] = []
+        self.distance_matrix: Dict[str, Dict[str, float]] = {}
+        self.routes: List[RouteChain] = []
         
-        # Consolidation parameters
-        self.MIN_DOGS_FOR_DRIVER = 12  # Drivers with fewer than 12 dogs get consolidated
-        self.MIN_GROUP_SIZE = 4        # Minimum dogs to keep a Group 1 or Group 3
-        self.CAPACITY_THRESHOLD = 2    # Minutes within which to consider equal
-        self.OUTLIER_MULTIPLIER = 1.5  # Dog is outlier if > 1.5x average distance (was 2x)
-        self.OUTLIER_ABSOLUTE = 3      # Dog is outlier if > 3 min from avg regardless of multiplier
-        
-        # Conversion for haversine fallback
-        self.MILES_TO_MINUTES = 2.5    # 1 mile ≈ 2.5 minutes city driving
-        
-        # Initialize data structures
-        self.distance_matrix = {}
-        self.dog_assignments = []
-        self.driver_capacities = {}
-        self.dog_name_to_id = {}
-        self.dog_id_to_name = {}
-        self.driver_assignment_counts = defaultdict(int)
-        self.active_drivers = set()
-        self.optimization_swaps = []
-        self.dog_coordinates = {}
-        
-        # Set up Google Sheets connection and load data
+        # Setup
         self.setup_google_sheets()
-        self.load_distance_matrix()
-        self.load_dog_assignments()
-        self.load_dog_coordinates()
+        self.load_data()
     
     def setup_google_sheets(self):
         """Set up Google Sheets API connection"""
@@ -134,1842 +146,1296 @@ class DogReassignmentSystem:
         except Exception as e:
             print(f"❌ Failed to connect to Google Sheets: {e}")
             raise
-
+    
+    def load_data(self):
+        """Load dogs and distance matrix from Google Sheets"""
+        try:
+            self.load_distance_matrix()
+            self.load_dogs()
+            
+            if not self.dogs:
+                print("❌ No dogs loaded - please check your data")
+                return
+                
+            print(f"\n📊 Loaded {len(self.dogs)} dogs")
+            
+            # Count dogs by group needs
+            group_counts = defaultdict(int)
+            for dog in self.dogs:
+                group_counts[tuple(sorted(dog.groups_needed))] += 1
+            
+            print("\n📊 Dogs by group needs:")
+            for groups, count in sorted(group_counts.items()):
+                groups_str = ','.join(map(str, groups))
+                print(f"   Groups [{groups_str}]: {count} dogs")
+                
+        except Exception as e:
+            print(f"❌ Error loading data: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def load_distance_matrix(self):
-        """Load time matrix from Google Sheets - NOW IN MINUTES"""
+        """Load the distance/time matrix"""
         try:
             spreadsheet = self.gc.open_by_key(self.DISTANCE_MATRIX_SHEET_ID)
-            try:
-                sheet = spreadsheet.worksheet(self.MATRIX_TAB)
-                print(f"✅ Found sheet by name: '{self.MATRIX_TAB}'")
-            except gspread.WorksheetNotFound:
-                sheet = spreadsheet.get_worksheet_by_id(398422902)
-                print(f"✅ Found sheet by ID: 398422902")
+            
+            # Try different sheet names
+            sheet = None
+            for sheet_name in ["Matrix", "Time Matrix", "Distance Matrix"]:
+                try:
+                    sheet = spreadsheet.worksheet(sheet_name)
+                    print(f"✅ Found sheet: '{sheet_name}'")
+                    break
+                except gspread.WorksheetNotFound:
+                    continue
+            
+            if not sheet:
+                print("❌ Could not find distance matrix sheet")
+                return
             
             all_values = sheet.get_all_values()
             
-            if not all_values:
-                print("❌ Time matrix sheet is empty")
+            if not all_values or len(all_values) < 2:
+                print("❌ Distance matrix is empty or too small")
                 return
             
-            # Get column headers from row 1, starting at B1
-            column_headers = all_values[0]
-            column_dog_ids = []
-            for i in range(1, len(column_headers)):
-                if column_headers[i].strip():
-                    column_dog_ids.append(column_headers[i].strip())
+            # Parse matrix - handle potential empty cells
+            header_dogs = []
+            for h in all_values[0][1:]:
+                if h and h.strip():
+                    header_dogs.append(h.strip())
             
-            print(f"📋 Column headers (B1 onwards): {column_dog_ids[:5]}...")
-            print(f"   Total column dogs: {len(column_dog_ids)}")
+            if not header_dogs:
+                print("❌ No column headers found in distance matrix")
+                return
             
-            # Build time matrix
-            times_loaded = 0
-            
-            for row_index in range(1, len(all_values)):
-                row = all_values[row_index]
-                
-                if len(row) == 0 or not row[0].strip():
+            distances_loaded = 0
+            for row_idx, row in enumerate(all_values[1:], 1):
+                if not row or len(row) < 2:
                     continue
-                    
-                from_dog_id = row[0].strip()
                 
-                for col_index in range(1, min(len(row), len(column_dog_ids) + 1)):
-                    if col_index < len(row) and row[col_index] and row[col_index].strip():
-                        to_dog_id = column_dog_ids[col_index - 1]
+                from_dog = row[0].strip() if row[0] else ""
+                if not from_dog:
+                    continue
+                
+                if from_dog not in self.distance_matrix:
+                    self.distance_matrix[from_dog] = {}
+                
+                for col_idx, value in enumerate(row[1:]):
+                    if col_idx >= len(header_dogs):
+                        break
                         
+                    to_dog = header_dogs[col_idx]
+                    
+                    if value and value.strip():
                         try:
-                            time_minutes = float(row[col_index].strip())
-                            
-                            if from_dog_id not in self.distance_matrix:
-                                self.distance_matrix[from_dog_id] = {}
-                            
-                            self.distance_matrix[from_dog_id][to_dog_id] = time_minutes
-                            times_loaded += 1
-                            
+                            time_min = float(value.strip())
+                            if time_min >= 0:  # Validate non-negative
+                                self.distance_matrix[from_dog][to_dog] = time_min
+                                distances_loaded += 1
                         except ValueError:
-                            pass
+                            # Skip invalid values
+                            continue
             
-            print(f"✅ Loaded {times_loaded} driving times")
+            print(f"✅ Loaded {distances_loaded} distance values")
             print(f"✅ Matrix has {len(self.distance_matrix)} dogs with time data")
             
-            if self.distance_matrix:
+            if self.distance_matrix and len(self.distance_matrix) > 0:
                 sample_dog = list(self.distance_matrix.keys())[0]
-                sample_times = list(self.distance_matrix[sample_dog].items())[:3]
-                print(f"✅ Sample: {sample_dog} → {sample_times}")
+                sample_count = len(self.distance_matrix[sample_dog])
+                print(f"✅ Sample: {sample_dog} has distances to {sample_count} other dogs")
                 
         except Exception as e:
-            print(f"❌ Error loading time matrix: {e}")
+            print(f"❌ Error loading distance matrix: {e}")
             import traceback
             traceback.print_exc()
             self.distance_matrix = {}
-
-    def load_dog_coordinates(self):
-        """Load dog coordinates from Map sheet for haversine fallback"""
+    
+    def load_dogs(self):
+        """Load dogs from the Map sheet"""
         try:
-            print("📍 Loading dog coordinates for time calculation fallback...")
-            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
-            all_values = sheet.get_all_values()
-            
-            lat_idx = 3  # Column D
-            lng_idx = 4  # Column E  
-            dog_id_idx = 9  # Column J
-            
-            coordinates_loaded = 0
-            for row in all_values[1:]:
-                if len(row) > max(lat_idx, lng_idx, dog_id_idx):
-                    try:
-                        dog_id = row[dog_id_idx].strip() if row[dog_id_idx] else ""
-                        lat_str = row[lat_idx].strip() if row[lat_idx] else ""
-                        lng_str = row[lng_idx].strip() if row[lng_idx] else ""
-                        
-                        if dog_id and lat_str and lng_str:
-                            lat = float(lat_str)
-                            lng = float(lng_str)
-                            if -90 <= lat <= 90 and -180 <= lng <= 180:  # Valid coordinates
-                                self.dog_coordinates[dog_id] = (lat, lng)
-                                coordinates_loaded += 1
-                    except (ValueError, IndexError):
-                        pass
-            
-            print(f"✅ Loaded coordinates for {coordinates_loaded} dogs")
-            
-        except Exception as e:
-            print(f"❌ Error loading dog coordinates: {e}")
-            self.dog_coordinates = {}
-
-    def haversine_time(self, dog_id1, dog_id2):
-        """Calculate driving time between two dogs using haversine formula"""
-        if dog_id1 not in self.dog_coordinates or dog_id2 not in self.dog_coordinates:
-            return float('inf')
-        
-        lat1, lon1 = self.dog_coordinates[dog_id1]
-        lat2, lon2 = self.dog_coordinates[dog_id2]
-        
-        # Check for same location
-        if lat1 == lat2 and lon1 == lon2:
-            return 0.0
-        
-        # Convert to radians
-        lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
-        lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
-        
-        # Haversine formula
-        dlat = lat2_rad - lat1_rad
-        dlon = lon2_rad - lon1_rad
-        a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
-        
-        # Clamp to avoid numerical errors
-        a = min(1.0, max(0.0, a))
-        
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        
-        # Earth's radius in miles
-        R = 3959
-        distance_miles = R * c
-        
-        # Convert to driving time in minutes
-        driving_factor = 1.3  # Account for roads vs straight line
-        driving_miles = distance_miles * driving_factor
-        driving_minutes = driving_miles * self.MILES_TO_MINUTES
-        
-        return max(0.0, driving_minutes)  # Ensure non-negative
-
-    def get_time_with_fallback(self, dog_id1, dog_id2):
-        """Get driving time between dogs with haversine fallback"""
-        # First, try the time matrix
-        time_minutes = self.safe_get_time(dog_id1, dog_id2)
-        if time_minutes < float('inf'):
-            return time_minutes
-        
-        # Fallback to haversine calculation
-        haversine_time = self.haversine_time(dog_id1, dog_id2)
-        if haversine_time < float('inf'):
-            if not hasattr(self, 'haversine_fallback_count'):
-                self.haversine_fallback_count = 0
-            self.haversine_fallback_count += 1
-            return haversine_time
-        
-        # Last resort
-        return self.EXCLUSION_DISTANCE
-
-    def safe_get_time(self, dog_id1, dog_id2):
-        """Safely get driving time between two dogs from matrix"""
-        if dog_id1 == dog_id2:
-            return 0.0
-        
-        # Try multiple ID formats to handle 'x' suffix variations
-        id1_variants = [dog_id1, dog_id1.rstrip('x'), f"{dog_id1}x"]
-        id2_variants = [dog_id2, dog_id2.rstrip('x'), f"{dog_id2}x"]
-        
-        for id1 in id1_variants:
-            for id2 in id2_variants:
-                if id1 in self.distance_matrix and id2 in self.distance_matrix[id1]:
-                    return self.distance_matrix[id1][id2]
-                if id2 in self.distance_matrix and id1 in self.distance_matrix[id2]:
-                    return self.distance_matrix[id2][id1]
-        
-        return float('inf')
-
-    def load_dog_assignments(self):
-        """Load dog assignments with correct column mappings"""
-        try:
-            print("📊 Loading assignments...")
-            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
+            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet("Map")
             all_values = sheet.get_all_values()
             
             if not all_values:
-                print("❌ No data found in assignments sheet")
+                print("❌ No dog data found")
                 return
             
-            # Column indices
-            dog_name_idx = 1    # Column B
-            combined_idx = 7    # Column H
-            dog_id_idx = 9      # Column J  
-            callout_idx = 10    # Column K
+            # Column indices (matching existing sheet structure - 0-indexed)
+            dog_name_idx = 1    # Column B - Dog name
+            address_idx = 2     # Column C - Address  
+            lat_idx = 3         # Column D - Latitude
+            lng_idx = 4         # Column E - Longitude
+            combined_idx = 7    # Column H - Combined (will be blank, we'll fill this)
+            dog_id_idx = 9      # Column J - Dog ID
+            callout_idx = 10    # Column K - Callout (groups needed, e.g. ":123")
             
-            # Load all dog data
-            drivers_found = set()
-            self.dog_assignments = []
-            callouts_found = 0
+            skipped_count = 0
             
-            for row_idx, row in enumerate(all_values[1:], 2):
-                if len(row) > max(dog_name_idx, combined_idx, dog_id_idx, callout_idx):
+            for row_idx, row in enumerate(all_values[1:], 2):  # Skip header, start at row 2
+                if len(row) <= max(dog_name_idx, lat_idx, lng_idx, dog_id_idx, callout_idx):
+                    continue
+                
+                try:
                     dog_name = row[dog_name_idx].strip() if row[dog_name_idx] else ""
-                    combined = row[combined_idx].strip() if row[combined_idx] else ""
                     dog_id = row[dog_id_idx].strip() if row[dog_id_idx] else ""
-                    callout = row[callout_idx].strip() if row[callout_idx] else ""
                     
-                    if dog_name and dog_id:
-                        assignment = {
-                            'row_index': row_idx,
-                            'dog_name': dog_name,
-                            'combined': combined,
-                            'dog_id': dog_id,
-                            'callout': callout
-                        }
-                        self.dog_assignments.append(assignment)
-                        
-                        self.dog_name_to_id[dog_name] = dog_id
-                        self.dog_id_to_name[dog_id] = dog_name
-                        
-                        if callout and not combined:
-                            callouts_found += 1
-                        
-                        if combined and ':' in combined:
-                            driver_name = combined.split(':')[0]
-                            if driver_name not in ['Field', 'Parking']:
-                                drivers_found.add(driver_name)
-                                self.driver_assignment_counts[driver_name] += 1
+                    # Parse coordinates
+                    lat = None
+                    lng = None
+                    if row[lat_idx].strip() and row[lng_idx].strip():
+                        try:
+                            lat = float(row[lat_idx].strip())
+                            lng = float(row[lng_idx].strip())
+                            
+                            # Validate coordinates
+                            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                                lat, lng = None, None
+                        except ValueError:
+                            pass
+                    
+                    callout = row[callout_idx].strip() if row[callout_idx] else ""
+                    address = row[address_idx].strip() if len(row) > address_idx else ""
+                    
+                    # Skip if missing required fields
+                    if not dog_name or not dog_id or lat is None or lng is None:
+                        if dog_name:  # Only report if there's a name but missing other data
+                            print(f"⚠️  Skipping {dog_name}: missing {'ID' if not dog_id else 'coordinates'}")
+                        skipped_count += 1
+                        continue
+                    
+                    # Parse groups needed from callout (e.g., ":1", ":23", ":123")
+                    groups_needed = []
+                    if callout:
+                        # Remove leading colon if present
+                        callout_clean = callout.lstrip(':')
+                        # Parse each character that's a valid group number
+                        for char in callout_clean:
+                            if char in ['1', '2', '3']:
+                                group_num = int(char)
+                                if group_num not in groups_needed:
+                                    groups_needed.append(group_num)
+                    
+                    if not groups_needed:
+                        print(f"⚠️  Skipping {dog_name}: no valid groups in callout '{callout}'")
+                        skipped_count += 1
+                        continue  # Skip dogs with no group assignments
+                    
+                    # Create dog object
+                    dog = Dog(
+                        dog_id=dog_id,
+                        name=dog_name,
+                        lat=lat,
+                        lng=lng,
+                        groups_needed=sorted(groups_needed),
+                        address=address
+                    )
+                    self.dogs.append(dog)
+                    
+                except (ValueError, IndexError) as e:
+                    skipped_count += 1
+                    continue
             
-            self.active_drivers = drivers_found
+            print(f"✅ Loaded {len(self.dogs)} dogs from Map sheet")
+            if skipped_count > 0:
+                print(f"⚠️  Skipped {skipped_count} rows (missing data or invalid format)")
             
-            print(f"✅ Found {len(drivers_found)} drivers from assignments")
-            print(f"✅ Loaded {len(self.dog_assignments)} dog assignments")
-            print(f"✅ Found {callouts_found} callouts needing assignment")
-            print(f"✅ Capacity will be calculated dynamically based on route density:")
-            print(f"   - Dense routes (avg < {self.DENSE_ROUTE_THRESHOLD} min): capacity 12")
-            print(f"   - Standard routes: capacity 8")
+            # Since combined column is blank, all dogs are unassigned - perfect!
+            print("✅ All dogs marked as unassigned (combined column blank)")
             
         except Exception as e:
-            print(f"❌ Error loading dog assignments: {e}")
-            raise
-
-    def calculate_driver_density(self, driver):
-        """Calculate route density for a driver and return capacity info"""
-        driver_dogs = []
-        for assignment in self.dog_assignments:
-            if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                driver_dogs.append(assignment)
+            print(f"❌ Error loading dogs: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def get_distance(self, dog1: Dog, dog2: Dog) -> float:
+        """Get distance between two dogs (with haversine fallback)"""
+        if not dog1 or not dog2:
+            return float('inf')
+            
+        if dog1.dog_id == dog2.dog_id:
+            return 0.0
         
-        if len(driver_dogs) < 2:
-            return {
-                'dog_count': len(driver_dogs),
-                'avg_time': 0.0,
-                'capacity': 8,
-                'is_dense': False
-            }
+        # Try multiple ID formats to handle 'x' suffix variations
+        id1_variants = [dog1.dog_id]
+        id2_variants = [dog2.dog_id]
         
-        # Calculate all pairwise times
-        times = []
-        for i in range(len(driver_dogs)):
-            for j in range(i + 1, len(driver_dogs)):
-                dog1_id = driver_dogs[i].get('dog_id', '')
-                dog2_id = driver_dogs[j].get('dog_id', '')
-                if dog1_id and dog2_id:
-                    time_min = self.get_time_with_fallback(dog1_id, dog2_id)
-                    if time_min < float('inf'):
-                        times.append(time_min)
-        
-        if not times:
-            avg_time = 0.0
+        # Add variants without 'x' if present
+        if dog1.dog_id.endswith('x'):
+            id1_variants.append(dog1.dog_id[:-1])
         else:
-            avg_time = sum(times) / len(times)
+            id1_variants.append(f"{dog1.dog_id}x")
+            
+        if dog2.dog_id.endswith('x'):
+            id2_variants.append(dog2.dog_id[:-1])
+        else:
+            id2_variants.append(f"{dog2.dog_id}x")
         
-        # Dense route if average time is less than threshold
-        is_dense = avg_time < self.DENSE_ROUTE_THRESHOLD
-        capacity = 12 if is_dense else 8
+        # Try matrix first with all ID variants
+        for id1 in id1_variants:
+            for id2 in id2_variants:
+                if id1 in self.distance_matrix and id2 in self.distance_matrix[id1]:
+                    distance = self.distance_matrix[id1][id2]
+                    if 0 <= distance < float('inf'):  # Validate distance
+                        return distance
+                if id2 in self.distance_matrix and id1 in self.distance_matrix[id2]:
+                    distance = self.distance_matrix[id2][id1]
+                    if 0 <= distance < float('inf'):  # Validate distance
+                        return distance
         
-        return {
-            'dog_count': len(driver_dogs),
-            'avg_time': avg_time,
-            'capacity': capacity,
-            'is_dense': is_dense
+        # Fallback to haversine
+        return self.haversine_distance(dog1, dog2)
+    
+    def haversine_distance(self, dog1: Dog, dog2: Dog) -> float:
+        """Calculate distance using haversine formula"""
+        # Check for same location
+        if dog1.lat == dog2.lat and dog1.lng == dog2.lng:
+            return 0.0
+        
+        try:
+            # Convert to radians
+            lat1, lon1 = math.radians(dog1.lat), math.radians(dog1.lng)
+            lat2, lon2 = math.radians(dog2.lat), math.radians(dog2.lng)
+            
+            # Haversine formula
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+            
+            # Clamp to valid range to avoid math domain errors
+            a = max(0.0, min(1.0, a))
+            
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+            
+            # Distance in miles, then convert to minutes
+            distance_miles = 3959 * c
+            driving_minutes = distance_miles * 1.3 * 2.5  # 1.3 for roads, 2.5 min/mile
+            
+            return max(0.0, driving_minutes)
+        except Exception as e:
+            print(f"⚠️  Error calculating distance: {e}")
+            return float('inf')
+    
+    def consolidate_small_groups(self, chains: List[RouteChain]) -> List[RouteChain]:
+        """Consolidate groups with less than minimum size (4 dogs)"""
+        print(f"\n🔄 Consolidating groups with < {self.MIN_GROUP_SIZE} dogs...")
+        
+        changes_made = True
+        consolidation_count = 0
+        
+        while changes_made:
+            changes_made = False
+            
+            for chain_idx, chain in enumerate(chains):
+                if not chain:  # Skip empty chains
+                    continue
+                
+                # Count dogs in each group
+                g1_count = len(chain.group1_dogs)
+                g2_count = len(chain.group2_dogs)
+                g3_count = len(chain.group3_dogs)
+                
+                # Don't consolidate if it would leave driver with no groups
+                if groups_count <= 1:
+                    continue
+                
+                # Special check: Figure out which groups would remain after consolidation
+                remaining_groups = []
+                if g1_count >= self.MIN_GROUP_SIZE:
+                    remaining_groups.append(1)
+                if g2_count >= self.MIN_GROUP_SIZE:
+                    remaining_groups.append(2)
+                if g3_count >= self.MIN_GROUP_SIZE:
+                    remaining_groups.append(3)
+                
+                # Don't consolidate if it would leave only Group 2
+                if remaining_groups == [2]:
+                    print(f"   ⚠️  Cannot consolidate {chain.driver_id} - would leave only Group 2")
+                    continue
+                
+                # Check each group for consolidation
+                for group_num, group_dogs, group_name in [
+                    (1, chain.group1_dogs, "Group 1"),
+                    (2, chain.group2_dogs, "Group 2"),
+                    (3, chain.group3_dogs, "Group 3")
+                ]:
+                    if 0 < len(group_dogs) < self.MIN_GROUP_SIZE:
+                        print(f"\n   ⚠️  {chain.driver_id} {group_name} has only {len(group_dogs)} dogs")
+                        
+                        # Find best alternative placement for each dog
+                        dogs_to_move = group_dogs.copy()
+                        successfully_moved = []
+                        
+                        for dog in dogs_to_move:
+                        # Ensure we have a valid dog name for error handling
+                        if dog and hasattr(dog, 'name'):
+                            dog_name = dog.name
+                        else:
+                            dog_name = f"Dog_{dog.dog_id if dog and hasattr(dog, 'dog_id') else 'Unknown'}"
+                            best_chain = None
+                            best_distance = float('inf')
+                            
+                            # Look for another chain with this group that has capacity
+                            for other_idx, other_chain in enumerate(chains):
+                                if other_idx == chain_idx or not other_chain:
+                                    continue
+                                
+                                # Get the appropriate group from other chain
+                                if group_num == 1:
+                                    other_group_dogs = other_chain.group1_dogs
+                                elif group_num == 2:
+                                    other_group_dogs = other_chain.group2_dogs
+                                else:
+                                    other_group_dogs = other_chain.group3_dogs
+                                
+                                # Skip if other chain doesn't have this group
+                                if len(other_group_dogs) == 0:
+                                    continue
+                                
+                                # Check capacity
+                                other_chain_density = self.calculate_chain_density(other_chain)
+                                capacity = self.DENSE_CAPACITY if other_chain_density < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
+                                
+                                if len(other_group_dogs) >= capacity:
+                                    continue
+                                
+                                # Calculate average distance to dogs in this group
+                                total_dist = 0
+                                for other_dog in other_group_dogs[:5]:  # Sample for efficiency
+                                    total_dist += self.get_distance(dog, other_dog)
+                                
+                                avg_dist = total_dist / min(5, len(other_group_dogs))
+                                
+                                if avg_dist < best_distance:
+                                    best_distance = avg_dist
+                                    best_chain = other_chain
+                            
+                            # Ensure we have a valid dog name
+                            dog_name = dog.name if hasattr(dog, 'name') else 'Unknown'
+                            
+                            # Move dog to best chain if found
+                            if best_chain and best_distance < 10.0:
+                                if group_num == 1:
+                                    best_chain.group1_dogs.append(dog)
+                                elif group_num == 2:
+                                    best_chain.group2_dogs.append(dog)
+                                else:
+                                    best_chain.group3_dogs.append(dog)
+                                
+                                successfully_moved.append(dog)
+                                print(f"      ✅ Moved {dog_name} to {best_chain.driver_id} ({best_distance:.1f}min)")
+                            else:
+                                print(f"      ❌ Could not find good placement for {dog_name}")
+                        
+                        # Remove successfully moved dogs from original chain
+                        if successfully_moved:
+                            if group_num == 1:
+                                chain.group1_dogs = [d for d in chain.group1_dogs if d not in successfully_moved]
+                            elif group_num == 2:
+                                chain.group2_dogs = [d for d in chain.group2_dogs if d not in successfully_moved]
+                            else:
+                                chain.group3_dogs = [d for d in chain.group3_dogs if d not in successfully_moved]
+                            
+                            consolidation_count += len(successfully_moved)
+                            changes_made = True
+                            break  # Re-evaluate this chain
+        
+        # Remove empty chains
+        chains = [c for c in chains if c and (c.group1_dogs or c.group2_dogs or c.group3_dogs)]
+        
+        # Renumber chains
+        for idx, chain in enumerate(chains):
+            chain.driver_id = f"Driver_{idx + 1:02d}"
+        
+        print(f"\n✅ Consolidation complete: {consolidation_count} dogs moved")
+        return chains
+    
+    def calculate_chain_density(self, chain: RouteChain) -> float:
+        """Calculate average distance within a chain to determine if it's dense"""
+        if not chain:
+            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
+            
+        all_dogs = []
+        seen_ids = set()
+        
+        # Safely collect all unique dogs
+        for dog in (chain.group1_dogs or []) + (chain.group2_dogs or []) + (chain.group3_dogs or []):
+            if dog and dog.dog_id not in seen_ids:
+                all_dogs.append(dog)
+                seen_ids.add(dog.dog_id)
+        
+        if len(all_dogs) < 2:
+            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
+        
+        # Sample distances to avoid O(n²) for large groups
+        distances = []
+        sample_size = min(10, len(all_dogs))
+        
+        for i in range(sample_size):
+            for j in range(i + 1, sample_size):
+                try:
+                    dist = self.get_distance(all_dogs[i], all_dogs[j])
+                    if dist < float('inf'):
+                        distances.append(dist)
+                except Exception:
+                    continue
+        
+        if distances:
+            return sum(distances) / len(distances)
+        else:
+            return self.DENSE_THRESHOLD + 1  # Default to standard capacity
+    
+    def build_transition_aware_chains(self):
+        """Build route chains considering G1→G2 and G2→G3 transitions"""
+        print("\n🔗 Building transition-aware chains...")
+        
+        # Separate dogs by groups they need
+        dogs_by_group = {
+            1: [d for d in self.dogs if d.needs_group(1)],
+            2: [d for d in self.dogs if d.needs_group(2)],
+            3: [d for d in self.dogs if d.needs_group(3)]
         }
-
-    def calculate_detour_value(self, detour_minutes, dogs_collected):
-        """
-        Calculate if a detour is worth it based on dogs collected
-        Detour Value = Dogs collected / Additional minutes
-        Threshold: > 0.7 dogs/minute is acceptable
-        Example: 5 dogs for 7 minutes = 0.71 ✓
-        """
-        if detour_minutes <= 0 or dogs_collected <= 0:
-            return {
-                'value': float('inf') if detour_minutes <= 0 else 0,
-                'is_acceptable': detour_minutes <= 0,
-                'dogs_per_minute': float('inf') if detour_minutes <= 0 else 0
-            }
         
-        value = dogs_collected / detour_minutes
-        is_acceptable = value > 0.7
+        print(f"📊 Dogs per group: G1={len(dogs_by_group[1])}, "
+              f"G2={len(dogs_by_group[2])}, G3={len(dogs_by_group[3])}")
         
-        return {
-            'value': value,
-            'is_acceptable': is_acceptable,
-            'dogs_per_minute': value
-        }
-
-    def parse_dog_groups_from_callout(self, callout):
-        """Parse groups from callout for capacity checking"""
-        if not callout:
+        # Check if we have enough dogs
+        if not any(dogs_by_group.values()):
+            print("❌ No dogs found in any group!")
             return []
         
-        callout_clean = callout.lstrip(':')
-        groups = []
+        # Strategy: Start with Group 2 (middle of chain) and build outward
+        used_dogs = set()
+        chains = []
         
-        for char in callout_clean:
-            if char in ['1', '2', '3']:
-                group_num = int(char)
-                if group_num not in groups:
-                    groups.append(group_num)
+        # If no G2 dogs, try different strategy
+        if not dogs_by_group[2]:
+            print("⚠️  No Group 2 dogs - using alternative clustering strategy")
+            return self.build_chains_without_g2(dogs_by_group)
         
-        return sorted(groups)
-
-    def phase1_assign_all_callouts(self):
-        """PHASE 1: Assign ALL callout dogs to closest driver (ignore capacity)
+        # Build clusters starting from Group 2
+        g2_clusters = self.cluster_dogs_with_capacity(dogs_by_group[2], eps_minutes=2.0)
         
-        Gets all unassigned dogs into the system quickly.
-        Capacity issues will be fixed in later phases.
-        """
-        print("\n🎯 PHASE 1: Assigning ALL callouts to closest driver (ignoring capacity)")
-        print("=" * 60)
+        print(f"\n📊 Created {len(g2_clusters)} Group 2 clusters")
         
-        # Check if we have any active drivers
-        if not self.active_drivers:
-            print("❌ No active drivers available for assignment!")
-            return 0
+        # For each G2 cluster, find matching G1 and G3 dogs
+        max_chains = 100  # Sanity check - prevent infinite chains
         
-        # Find all callouts that need assignment
-        callouts = []
-        for assignment in self.dog_assignments:
-            if isinstance(assignment, dict):
-                callout = assignment.get('callout', '').strip()
-                combined = assignment.get('combined', '').strip()
-                
-                if callout and not combined:
-                    callouts.append(assignment)
-        
-        print(f"📊 Found {len(callouts)} callout dogs to assign")
-        
-        assignments_made = 0
-        
-        for callout in callouts:
-            dog_name = callout.get('dog_name', 'Unknown')
-            dog_id = callout.get('dog_id', '')
-            original_callout = callout.get('callout', '').strip()
-            
-            if not original_callout:
-                print(f"❌ {dog_name}: No callout specified")
-                continue
-            
-            # Find closest driver (considering ALL drivers)
-            best_driver = None
-            best_time = float('inf')
-            
-            for driver in self.active_drivers:
-                # Get driver's current dogs
-                driver_dogs = []
-                for assignment in self.dog_assignments:
-                    if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                        driver_dogs.append(assignment)
-                
-                if not driver_dogs:
-                    # Empty driver - assign with default time
-                    avg_time = 5.0  # Default 5 minutes
-                else:
-                    # Calculate average time to driver's existing dogs
-                    times = []
-                    for existing_dog in driver_dogs:
-                        existing_dog_id = existing_dog.get('dog_id', '')
-                        if existing_dog_id and dog_id:
-                            time_min = self.get_time_with_fallback(dog_id, existing_dog_id)
-                            if time_min < float('inf'):
-                                times.append(time_min)
-                    
-                    if times:
-                        avg_time = sum(times) / len(times)
-                    else:
-                        avg_time = 5.0  # Default if can't calculate
-                
-                if avg_time < best_time:
-                    best_time = avg_time
-                    best_driver = driver
-            
-            if best_driver:
-                # Preserve exact original callout format
-                if original_callout.startswith(':'):
-                    group_part = original_callout
-                else:
-                    group_part = ':' + original_callout
-                
-                new_assignment = f"{best_driver}{group_part}"
-                callout['combined'] = new_assignment
-                
-                # Check detour value if this was far
-                if best_time > 5:
-                    detour_calc = self.calculate_detour_value(best_time, 1)
-                    detour_msg = f" [Detour: {detour_calc['dogs_per_minute']:.2f} dogs/min - "
-                    detour_msg += "✓]" if detour_calc['is_acceptable'] else "✗]"
-                else:
-                    detour_msg = ""
-                
-                print(f"   ✅ {dog_name} → {best_driver} ({best_time:.1f} min avg) "
-                      f"for callout '{original_callout}'{detour_msg}")
-                assignments_made += 1
-            else:
-                print(f"❌ {dog_name}: No driver found")
-        
-        print(f"\n✅ Phase 1 Complete: {assignments_made} dogs assigned")
-        return assignments_made
-
-    def phase2_consolidate_small_drivers(self):
-        """PHASE 2: Consolidate drivers with < 12 total dogs
-        
-        Gives small drivers the day off by redistributing their dogs.
-        Dogs keep their original group assignments (1, 2, 3).
-        """
-        print("\n🔄 PHASE 2: Consolidating small drivers (< 12 dogs)")
-        print("=" * 60)
-        
-        # Count dogs per driver
-        driver_dog_counts = defaultdict(list)
-        for assignment in self.dog_assignments:
-            if isinstance(assignment, dict) and assignment.get('combined', '').strip():
-                combined = assignment['combined']
-                if ':' in combined:
-                    driver = combined.split(':')[0]
-                    if driver not in ['Field', 'Parking']:
-                        driver_dog_counts[driver].append(assignment)
-        
-        # Find drivers to consolidate
-        drivers_to_consolidate = []
-        for driver, dogs in driver_dog_counts.items():
-            if len(dogs) < self.MIN_DOGS_FOR_DRIVER:  # Less than 12 dogs
-                drivers_to_consolidate.append((driver, dogs))
-        
-        print(f"🔍 Found {len(drivers_to_consolidate)} drivers to consolidate")
-        
-        if not drivers_to_consolidate:
-            print("✅ No small drivers to consolidate")
-            return 0
-        
-        dogs_moved = 0
-        
-        for driver_to_remove, dogs_to_move in drivers_to_consolidate:
-            print(f"\n📤 Consolidating {driver_to_remove} ({len(dogs_to_move)} dogs):")
-            
-            # Calculate average position of this driver's dogs
-            driver_center_lat = 0
-            driver_center_lng = 0
-            valid_coords = 0
-            
-            for dog in dogs_to_move:
-                dog_id = dog.get('dog_id', '')
-                if dog_id in self.dog_coordinates:
-                    lat, lng = self.dog_coordinates[dog_id]
-                    driver_center_lat += lat
-                    driver_center_lng += lng
-                    valid_coords += 1
-            
-            if valid_coords > 0:
-                driver_center_lat /= valid_coords
-                driver_center_lng /= valid_coords
-            
-            # Reassign each dog to the best alternative driver
-            for dog in dogs_to_move:
-                dog_name = dog.get('dog_name', 'Unknown')
-                dog_id = dog.get('dog_id', '')
-                original_groups = dog['combined'].split(':', 1)[1]
-                
-                # Find best alternative driver
-                best_driver = None
-                best_time = float('inf')
-                
-                for other_driver in self.active_drivers:
-                    if other_driver == driver_to_remove:
-                        continue
-                    
-                    # Calculate average time to this driver's dogs
-                    other_driver_dogs = driver_dog_counts.get(other_driver, [])
-                    if not other_driver_dogs:
-                        continue
-                    
-                    times = []
-                    for other_dog in other_driver_dogs:
-                        other_dog_id = other_dog.get('dog_id', '')
-                        if other_dog_id and dog_id:
-                            time_min = self.get_time_with_fallback(dog_id, other_dog_id)
-                            if time_min < float('inf'):
-                                times.append(time_min)
-                    
-                    if times:
-                        avg_time = sum(times) / len(times)
-                        if avg_time < best_time:
-                            best_time = avg_time
-                            best_driver = other_driver
-                
-                if best_driver:
-                    # CRITICAL: Preserve original group assignment
-                    dog['combined'] = f"{best_driver}:{original_groups}"
-                    dogs_moved += 1
-                    print(f"   ✅ {dog_name} → {best_driver} ({best_time:.1f} min)")
-            
-            # Remove this driver from active drivers
-            self.active_drivers.discard(driver_to_remove)
-            print(f"   🏠 {driver_to_remove} can take the day off!")
-        
-        print(f"\n✅ Phase 2 Complete: {dogs_moved} dogs moved, "
-              f"{len(drivers_to_consolidate)} drivers eliminated")
-        return dogs_moved
-
-    def phase3_cluster_nearby_dogs(self):
-        """PHASE 3: Ensure dogs < 1 minute apart in same group go to same driver
-        
-        This phase runs BEFORE capacity balancing to create natural clusters.
-        Helps prevent outliers by keeping nearby dogs together.
-        
-        Uses connected components to find clusters:
-        - If A is < 1 min from B, and B is < 1 min from C, then A, B, C form a cluster
-        - All dogs in a cluster should go to the same driver
-        - Driver with most dogs in the cluster wins (if capacity allows)
-        - Respects capacity limits - won't cluster if it would exceed capacity
-        """
-        print("\n🔗 PHASE 3: Clustering nearby dogs (< 1 minute apart)")
-        print("=" * 60)
-        
-        moves_made = 0
-        
-        # Process each group separately
-        for group_num in [1, 2, 3]:
-            print(f"\n📊 Processing Group {group_num}:")
-            
-            # Get all dogs in this group with their current drivers
-            group_dogs = []
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').strip():
-                    groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
-                    if group_num in groups:
-                        combined = assignment['combined']
-                        driver = combined.split(':')[0] if ':' in combined else None
-                        if driver and driver not in ['Field', 'Parking']:
-                            group_dogs.append({
-                                'assignment': assignment,
-                                'driver': driver,
-                                'dog_id': assignment.get('dog_id', ''),
-                                'dog_name': assignment.get('dog_name', 'Unknown')
-                            })
-            
-            if len(group_dogs) < 2:
-                print(f"   Only {len(group_dogs)} dogs in group - skipping")
-                continue
-            
-            # Build adjacency list of dogs < 1 minute apart
-            nearby_dogs = defaultdict(list)
-            for i, dog1_data in enumerate(group_dogs):
-                dog1_id = dog1_data['dog_id']
-                
-                for j, dog2_data in enumerate(group_dogs):
-                    if i != j:
-                        dog2_id = dog2_data['dog_id']
-                        time_between = self.get_time_with_fallback(dog1_id, dog2_id)
-                        
-                        if time_between < self.CLUSTER_THRESHOLD:
-                            nearby_dogs[dog1_id].append({
-                                'dog_data': dog2_data,
-                                'time': time_between
-                            })
-            
-            # Find clusters using connected components
-            visited = set()
-            clusters = []
-            
-            for dog_data in group_dogs:
-                dog_id = dog_data['dog_id']
-                if dog_id not in visited:
-                    # BFS to find all connected dogs
-                    cluster = []
-                    queue = [dog_data]
-                    
-                    while queue:
-                        current = queue.pop(0)
-                        current_id = current['dog_id']
-                        
-                        if current_id in visited:
-                            continue
-                            
-                        visited.add(current_id)
-                        cluster.append(current)
-                        
-                        # Add all nearby dogs to queue
-                        for nearby in nearby_dogs.get(current_id, []):
-                            if nearby['dog_data']['dog_id'] not in visited:
-                                queue.append(nearby['dog_data'])
-                    
-                    if len(cluster) > 1:
-                        clusters.append(cluster)
-            
-            # Process each cluster
-            for cluster_idx, cluster in enumerate(clusters):
-                # Check if all dogs in cluster have same driver
-                drivers_in_cluster = set(dog['driver'] for dog in cluster)
-                
-                if len(drivers_in_cluster) > 1:
-                    # Need to consolidate - choose driver with most dogs in cluster
-                    driver_counts = Counter(dog['driver'] for dog in cluster)
-                    
-                    # Check capacity constraints for each potential driver
-                    valid_drivers = []
-                    for driver, count in driver_counts.items():
-                        # Get current capacity for this driver
-                        capacity_info = self.calculate_driver_density(driver)
-                        capacity = capacity_info['capacity']
-                        
-                        # Count current dogs in this group for this driver
-                        current_in_group = sum(1 for d in group_dogs if d['driver'] == driver)
-                        
-                        # Calculate how many additional dogs would be added
-                        dogs_to_add = len(cluster) - count
-                        
-                        # Check if driver can handle the additional dogs
-                        if current_in_group + dogs_to_add <= capacity:
-                            valid_drivers.append((driver, count))
-                    
-                    if not valid_drivers:
-                        print(f"\n   ⚠️  Cannot cluster {len(cluster)} dogs - would exceed all drivers' capacity")
-                        print(f"      Cluster contains:")
-                        for dog in cluster:
-                            print(f"      - {dog['dog_name']} (with {dog['driver']})")
-                        continue
-                    
-                    # Choose driver with most dogs in cluster from valid options
-                    valid_drivers.sort(key=lambda x: -x[1])
-                    winning_driver = valid_drivers[0][0]
-                    
-                    print(f"\n   🔗 Found cluster of {len(cluster)} dogs (< {self.CLUSTER_THRESHOLD} min chain):")
-                    for dog in cluster:
-                        print(f"      - {dog['dog_name']} (currently with {dog['driver']})")
-                    print(f"      → Consolidating all to {winning_driver}")
-                    
-                    # Move all dogs to winning driver
-                    for dog_data in cluster:
-                        if dog_data['driver'] != winning_driver:
-                            # Update assignment
-                            original_groups = dog_data['assignment']['combined'].split(':', 1)[1]
-                            dog_data['assignment']['combined'] = f"{winning_driver}:{original_groups}"
-                            dog_data['driver'] = winning_driver
-                            moves_made += 1
-                            print(f"      ✅ Moved {dog_data['dog_name']} to {winning_driver}")
-            
-            if not clusters:
-                print(f"   No clusters found (no dogs < {self.CLUSTER_THRESHOLD} min apart with different drivers)")
-            else:
-                print(f"   Found {len(clusters)} total clusters in group {group_num}")
-        
-        print(f"\n✅ Phase 3 Complete: {moves_made} dogs clustered with nearby neighbors")
-        if moves_made > 0:
-            print(f"   (Creates efficient routes by keeping nearby dogs together)")
-        return moves_made
-
-    def phase4_remove_outliers_all_groups(self):
-        """PHASE 4: Remove outliers from ALL groups (not just over-capacity)
-        
-        More aggressive outlier detection using multiple criteria:
-        - Dogs > 1.5x the average distance from others in their group
-        - Dogs > 3 minutes from their average position (absolute threshold)
-        - Dogs > 3 minutes from their nearest neighbor
-        
-        Moves outliers to the closest available group regardless of capacity.
-        This creates more cohesive groups before worrying about capacity limits.
-        """
-        print("\n🎯 PHASE 4: Removing outliers from ALL groups")
-        print("=" * 60)
-        
-        moves_made = 0
-        
-        # Process each driver and group
-        for driver in self.active_drivers:
-            # Get all dogs for this driver grouped by group number
-            driver_groups = defaultdict(list)
-            
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                    combined = assignment['combined']
-                    groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
-                    for group in groups:
-                        driver_groups[group].append(assignment)
-            
-            # Analyze each group
-            for group_num, dogs in driver_groups.items():
-                if len(dogs) < 3:  # Need at least 3 dogs to meaningfully identify outliers
-                    continue
-                
-                # Calculate average distance between all dogs in group
-                all_distances = []
-                for i in range(len(dogs)):
-                    for j in range(i + 1, len(dogs)):
-                        dog1_id = dogs[i].get('dog_id', '')
-                        dog2_id = dogs[j].get('dog_id', '')
-                        if dog1_id and dog2_id:
-                            time_min = self.get_time_with_fallback(dog1_id, dog2_id)
-                            if time_min < float('inf'):
-                                all_distances.append(time_min)
-                
-                if not all_distances:
-                    continue
-                
-                avg_distance = sum(all_distances) / len(all_distances)
-                outlier_threshold_multiplier = avg_distance * self.OUTLIER_MULTIPLIER
-                outlier_threshold_absolute = self.OUTLIER_ABSOLUTE
-                
-                # Use the more aggressive threshold
-                outlier_threshold = min(outlier_threshold_multiplier, outlier_threshold_absolute)
-                
-                print(f"\n📊 {driver} Group {group_num}: {len(dogs)} dogs")
-                print(f"   Average distance between dogs: {avg_distance:.1f} min")
-                print(f"   Outlier threshold: {outlier_threshold:.1f} min")
-                print(f"   (Using more aggressive of: {outlier_threshold_multiplier:.1f} min [1.5x avg] or {outlier_threshold_absolute} min [absolute])")
-                print(f"   Looking for dogs whose avg distance to others > {outlier_threshold:.1f} min")
-                
-                # Find outliers (dogs whose average distance to others > threshold OR min distance is high)
-                outliers = []
-                for i, dog in enumerate(dogs):
-                    dog_id = dog.get('dog_id', '')
-                    if not dog_id:
-                        continue
-                    
-                    # Calculate average distance to all other dogs AND minimum distance
-                    distances_to_others = []
-                    min_distance = float('inf')
-                    
-                    for j, other_dog in enumerate(dogs):
-                        if i != j:
-                            other_id = other_dog.get('dog_id', '')
-                            if other_id:
-                                time_min = self.get_time_with_fallback(dog_id, other_id)
-                                if time_min < float('inf'):
-                                    distances_to_others.append(time_min)
-                                    if time_min < min_distance:
-                                        min_distance = time_min
-                    
-                    if distances_to_others:
-                        avg_to_others = sum(distances_to_others) / len(distances_to_others)
-                        
-                        # Dog is outlier if:
-                        # 1. Average distance > threshold, OR
-                        # 2. Minimum distance to nearest neighbor > 3 minutes
-                        if avg_to_others > outlier_threshold or min_distance > 3:
-                            outliers.append({
-                                'dog': dog,
-                                'avg_distance': avg_to_others,
-                                'min_distance': min_distance,
-                                'dog_name': dog.get('dog_name', 'Unknown')
-                            })
-                
-                if not outliers:
-                    print("   ✅ No outliers found")
-                    continue
-                
-                # Sort outliers by how far they are from the group (consider both metrics)
-                outliers.sort(key=lambda x: (-x['avg_distance'], -x.get('min_distance', 0)))
-                
-                print(f"   ⚠️  Found {len(outliers)} outlier(s):")
-                for outlier in outliers[:5]:  # Show top 5
-                    reasons = []
-                    if outlier['avg_distance'] > outlier_threshold:
-                        reasons.append(f"avg {outlier['avg_distance']:.1f}min > {outlier_threshold:.1f}min")
-                    if outlier['min_distance'] > 3:
-                        reasons.append(f"nearest neighbor {outlier['min_distance']:.1f}min away")
-                    reason = " AND ".join(reasons)
-                    print(f"      - {outlier['dog_name']}: {reason}")
-                
-                # Move outliers to better locations
-                for outlier_data in outliers:
-                    dog = outlier_data['dog']
-                    dog_id = dog.get('dog_id', '')
-                    dog_name = outlier_data['dog_name']
-                    
-                    # Find the closest group (same group number, different driver)
-                    best_option = None
-                    best_avg_distance = float('inf')
-                    
-                    for other_driver in self.active_drivers:
-                        if other_driver == driver:
-                            continue
-                        
-                        # Get dogs in same group number for other driver
-                        other_dogs = []
-                        for assignment in self.dog_assignments:
-                            if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{other_driver}:"):
-                                groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
-                                if group_num in groups:
-                                    other_dogs.append(assignment)
-                        
-                        if not other_dogs:
-                            continue
-                        
-                        # Calculate average distance to these dogs
-                        distances = []
-                        for other_dog in other_dogs:
-                            other_id = other_dog.get('dog_id', '')
-                            if other_id and dog_id:
-                                time_min = self.get_time_with_fallback(dog_id, other_id)
-                                if time_min < float('inf'):
-                                    distances.append(time_min)
-                        
-                        if distances:
-                            avg_dist = sum(distances) / len(distances)
-                            if avg_dist < best_avg_distance:
-                                best_avg_distance = avg_dist
-                                best_option = {
-                                    'driver': other_driver,
-                                    'avg_distance': avg_dist,
-                                    'dog_count': len(other_dogs)
-                                }
-                    
-                    # Move if we found a better location
-                    if best_option and best_avg_distance < outlier_threshold:
-                        # Update assignment - keep same group
-                        original_groups = dog['combined'].split(':', 1)[1]
-                        old_assignment = dog['combined']
-                        dog['combined'] = f"{best_option['driver']}:{original_groups}"
-                        
-                        print(f"   ✅ Moved outlier {dog_name}: {old_assignment} → {dog['combined']}")
-                        print(f"      New average distance: {best_option['avg_distance']:.1f} min (was {outlier_data['avg_distance']:.1f})")
-                        moves_made += 1
-                    else:
-                        print(f"   ❌ No better location found for {dog_name}")
-        
-        print(f"\n✅ Phase 4 Complete: {moves_made} outliers moved")
-        if moves_made > 0:
-            print(f"   (Using aggressive criteria: > 1.5x avg OR > 3 min absolute OR > 3 min to nearest)")
-        return moves_made
-
-    def phase5_consolidate_small_groups(self):
-        """PHASE 5: Consolidate small Group 1 or Group 3 assignments
-        
-        If a driver has < 4 dogs in Group 1 or Group 3, redistribute those dogs.
-        Each dog is moved to its CLOSEST neighbor in the same group number.
-        
-        CRITICAL RULES:
-        - Only consolidate if driver has ALL 3 groups (1, 2, and 3)
-        - Never leave a driver with only one group (not worth coming in)
-        - Never eliminate Group 2 alone (would create dead time between pickups)
-        - Each dog goes to its individual closest neighbor (not all to same driver)
-        
-        Valid consolidations:
-        - Has Groups 1,2,3 and Group 1 < 4 dogs → move each Group 1 dog to its closest neighbor
-        - Has Groups 1,2,3 and Group 3 < 4 dogs → move each Group 3 dog to its closest neighbor
-        - Has only Groups 1,2 or 2,3 → keep as is (can't reduce further)
-        """
-        print("\n🔄 PHASE 5: Consolidating small Group 1 or Group 3 assignments")
-        print("=" * 60)
-        
-        moves_made = 0
-        
-        # Analyze each driver's groups
-        for driver in list(self.active_drivers):  # Use list() to avoid modification during iteration
-            # Count dogs per group for this driver
-            driver_groups = defaultdict(list)
-            
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                    combined = assignment['combined']
-                    groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
-                    for group in groups:
-                        driver_groups[group].append(assignment)
-            
-            # Check which groups this driver has
-            has_group1 = 1 in driver_groups and len(driver_groups[1]) > 0
-            has_group2 = 2 in driver_groups and len(driver_groups[2]) > 0
-            has_group3 = 3 in driver_groups and len(driver_groups[3]) > 0
-            
-            group1_count = len(driver_groups[1]) if has_group1 else 0
-            group2_count = len(driver_groups[2]) if has_group2 else 0
-            group3_count = len(driver_groups[3]) if has_group3 else 0
-            
-            print(f"\n📊 {driver}: G1={group1_count}, G2={group2_count}, G3={group3_count}")
-            
-            # Determine what can be consolidated
-            can_move_group1 = False
-            can_move_group3 = False
-            
-            # Only consolidate if driver has all 3 groups
-            if has_group1 and has_group2 and has_group3:
-                if group1_count < self.MIN_GROUP_SIZE:
-                    can_move_group1 = True
-                    print(f"   ⚠️  Group 1 has only {group1_count} dogs (< {self.MIN_GROUP_SIZE})")
-                
-                if group3_count < self.MIN_GROUP_SIZE:
-                    can_move_group3 = True
-                    print(f"   ⚠️  Group 3 has only {group3_count} dogs (< {self.MIN_GROUP_SIZE})")
-            else:
-                print(f"   ℹ️  Driver doesn't have all 3 groups - preserving current assignment")
-            
-            # Move Group 1 if needed - EACH DOG TO ITS CLOSEST NEIGHBOR
-            if can_move_group1:
-                dogs_to_move = driver_groups[1]
-                print(f"   🔄 Moving {len(dogs_to_move)} dogs from Group 1 to closest neighbors:")
-                
-                for dog in dogs_to_move:
-                    dog_name = dog.get('dog_name', 'Unknown')
-                    dog_id = dog.get('dog_id', '')
-                    
-                    # Find ALL Group 1 dogs across all other drivers
-                    best_option = None
-                    best_time = float('inf')
-                    
-                    for other_driver in self.active_drivers:
-                        if other_driver == driver:
-                            continue
-                        
-                        # Get other driver's Group 1 dogs
-                        other_group1_dogs = []
-                        for assignment in self.dog_assignments:
-                            if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{other_driver}:"):
-                                groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
-                                if 1 in groups:
-                                    other_group1_dogs.append(assignment)
-                        
-                        if not other_group1_dogs:
-                            continue
-                        
-                        # Find CLOSEST single dog in this driver's Group 1
-                        for other_dog in other_group1_dogs:
-                            other_id = other_dog.get('dog_id', '')
-                            if other_id and dog_id:
-                                time_min = self.get_time_with_fallback(dog_id, other_id)
-                                if time_min < best_time:
-                                    best_time = time_min
-                                    best_option = {
-                                        'driver': other_driver,
-                                        'closest_dog': other_dog.get('dog_name', 'Unknown'),
-                                        'time': time_min
-                                    }
-                    
-                    if best_option:
-                        # Update assignment
-                        original_groups = dog['combined'].split(':', 1)[1]
-                        dog['combined'] = f"{best_option['driver']}:{original_groups}"
-                        print(f"      ✅ {dog_name} → {best_option['driver']} "
-                              f"(closest to {best_option['closest_dog']}, {best_option['time']:.1f} min)")
-                        moves_made += 1
-                    else:
-                        print(f"      ❌ No suitable destination found for {dog_name}")
-            
-            # Move Group 3 if needed - EACH DOG TO ITS CLOSEST NEIGHBOR
-            if can_move_group3:
-                dogs_to_move = driver_groups[3]
-                print(f"   🔄 Moving {len(dogs_to_move)} dogs from Group 3 to closest neighbors:")
-                
-                for dog in dogs_to_move:
-                    dog_name = dog.get('dog_name', 'Unknown')
-                    dog_id = dog.get('dog_id', '')
-                    
-                    # Find ALL Group 3 dogs across all other drivers
-                    best_option = None
-                    best_time = float('inf')
-                    
-                    for other_driver in self.active_drivers:
-                        if other_driver == driver:
-                            continue
-                        
-                        # Get other driver's Group 3 dogs
-                        other_group3_dogs = []
-                        for assignment in self.dog_assignments:
-                            if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{other_driver}:"):
-                                groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
-                                if 3 in groups:
-                                    other_group3_dogs.append(assignment)
-                        
-                        if not other_group3_dogs:
-                            continue
-                        
-                        # Find CLOSEST single dog in this driver's Group 3
-                        for other_dog in other_group3_dogs:
-                            other_id = other_dog.get('dog_id', '')
-                            if other_id and dog_id:
-                                time_min = self.get_time_with_fallback(dog_id, other_id)
-                                if time_min < best_time:
-                                    best_time = time_min
-                                    best_option = {
-                                        'driver': other_driver,
-                                        'closest_dog': other_dog.get('dog_name', 'Unknown'),
-                                        'time': time_min
-                                    }
-                    
-                    if best_option:
-                        # Update assignment
-                        original_groups = dog['combined'].split(':', 1)[1]
-                        dog['combined'] = f"{best_option['driver']}:{original_groups}"
-                        print(f"      ✅ {dog_name} → {best_option['driver']} "
-                              f"(closest to {best_option['closest_dog']}, {best_option['time']:.1f} min)")
-                        moves_made += 1
-                    else:
-                        print(f"      ❌ No suitable destination found for {dog_name}")
-            
-            # Check if driver now has no dogs
-            remaining_dogs = 0
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                    remaining_dogs += 1
-            
-            if remaining_dogs == 0:
-                self.active_drivers.discard(driver)
-                print(f"   🏠 {driver} now has no dogs - removing from active drivers")
-        
-        print(f"\n✅ Phase 5 Complete: {moves_made} dogs moved from small groups")
-        if moves_made > 0:
-            print(f"   (Each dog moved to its closest individual neighbor)")
-        return moves_made
-
-    def phase6_balance_capacity(self):
-        """PHASE 6: Balance capacity by enforcing hard capacity limits
-        
-        Uses NEAREST NEIGHBOR approach for route efficiency:
-        - Ranks dogs by their minimum distance to nearest neighbor
-        - Preserves connected chains of dogs
-        - Moves isolated dogs first (those requiring detours)
-        
-        Dogs stay in their assigned groups (1, 2, 3).
-        """
-        print("\n⚖️ PHASE 6: Balancing capacity (NEAREST NEIGHBOR approach)")
-        print("=" * 60)
-        
-        moves_made = 0
-        iteration = 0
-        max_iterations = 50
-        
-        while iteration < max_iterations:
-            iteration += 1
-            print(f"\n🔄 Iteration {iteration}:")
-            
-            # Find over-capacity groups
-            over_capacity_groups = []
-            
-            for driver in self.active_drivers:
-                capacity_info = self.calculate_driver_density(driver)
-                capacity = capacity_info['capacity']
-                
-                # Count dogs per group for this driver
-                group_counts = defaultdict(int)
-                driver_dogs = defaultdict(list)
-                
-                for assignment in self.dog_assignments:
-                    if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                        combined = assignment['combined']
-                        groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
-                        for group in groups:
-                            group_counts[group] += 1
-                            driver_dogs[group].append(assignment)
-                
-                # Check each group's capacity
-                for group_num, count in group_counts.items():
-                    if count > capacity:
-                        over_capacity_groups.append({
-                            'driver': driver,
-                            'group': group_num,
-                            'count': count,
-                            'capacity': capacity,
-                            'over_by': count - capacity,
-                            'dogs': driver_dogs[group_num],
-                            'avg_time': capacity_info['avg_time']
-                        })
-            
-            if not over_capacity_groups:
-                print("✅ All groups within capacity!")
+        for cluster_idx, g2_cluster in enumerate(g2_clusters):
+            if cluster_idx >= max_chains:
+                print(f"⚠️  Reached maximum chains limit ({max_chains})")
                 break
-            
-            # Sort by how much they're over (most over first)
-            over_capacity_groups.sort(key=lambda x: -x['over_by'])
-            
-            print(f"Found {len(over_capacity_groups)} over-capacity groups")
-            
-            # Process the most over-capacity group
-            group_to_fix = over_capacity_groups[0]
-            dogs_to_move_count = group_to_fix['over_by']
-            
-            print(f"\n🎯 Fixing {group_to_fix['driver']} Group {group_to_fix['group']}: "
-                  f"{group_to_fix['count']}/{group_to_fix['capacity']} dogs "
-                  f"(need to move {dogs_to_move_count} dogs)")
-            
-            # Analyze connectivity for each dog
-            dogs_with_connectivity = []
-            
-            for dog in group_to_fix['dogs']:
-                dog_id = dog.get('dog_id', '')
-                dog_name = dog.get('dog_name', 'Unknown')
                 
-                if not dog_id:
-                    continue
+            if not g2_cluster:
+                continue
+            
+            # Determine capacity based on cluster density
+            # Calculate average distance within G2 cluster to determine if it's dense
+            if len(g2_cluster) > 1:
+                cluster_distances = []
+                for i in range(len(g2_cluster)):
+                    for j in range(i + 1, len(g2_cluster)):
+                        dist = self.get_distance(g2_cluster[i], g2_cluster[j])
+                        if dist < float('inf'):
+                            cluster_distances.append(dist)
                 
-                # Find minimum distance to any neighbor and count close neighbors
-                min_distance = float('inf')
-                close_neighbors = 0  # Count of neighbors within 1 minute
-                very_close_neighbors = 0  # Count of neighbors within 0.5 minutes
+                if cluster_distances:
+                    avg_cluster_distance = sum(cluster_distances) / len(cluster_distances)
+                    is_dense = avg_cluster_distance < self.DENSE_THRESHOLD
+                    capacity = self.DENSE_CAPACITY if is_dense else self.STANDARD_CAPACITY
+                else:
+                    capacity = self.STANDARD_CAPACITY
+            else:
+                capacity = self.STANDARD_CAPACITY
+            
+            print(f"\n🔍 Processing G2 cluster {cluster_idx + 1} ({len(g2_cluster)} dogs)")
+            print(f"   Capacity: {capacity} dogs per group ({'DENSE' if capacity == self.DENSE_CAPACITY else 'STANDARD'} route)")
+            
+            # Ensure G2 cluster itself doesn't exceed capacity
+            if len(g2_cluster) > capacity:
+                print(f"   ⚠️  G2 cluster has {len(g2_cluster)} dogs, exceeds capacity of {capacity}")
+                # Take only up to capacity
+                g2_cluster = g2_cluster[:capacity]
+            
+            # Find center of G2 cluster
+            if not g2_cluster:  # Safety check after potential truncation
+                continue
                 
-                for other_dog in group_to_fix['dogs']:
-                    if other_dog != dog:
-                        other_id = other_dog.get('dog_id', '')
-                        if other_id:
-                            time_min = self.get_time_with_fallback(dog_id, other_id)
-                            if time_min < float('inf'):
-                                if time_min < min_distance:
-                                    min_distance = time_min
-                                if time_min <= 1.0:
-                                    close_neighbors += 1
-                                if time_min <= 0.5:
-                                    very_close_neighbors += 1
-                
-                # Find best alternative placement
-                best_alt = self.find_best_alternative_placement(
-                    dog, group_to_fix['group'], group_to_fix['driver']
+            g2_center_lat = sum(d.lat for d in g2_cluster) / len(g2_cluster)
+            g2_center_lng = sum(d.lng for d in g2_cluster) / len(g2_cluster)
+            
+            # For G2 dogs that also need G1 or G3, ensure they appear in those groups too
+            g1_from_g2 = [d for d in g2_cluster if d.needs_group(1) and d.dog_id not in used_dogs]
+            g3_from_g2 = [d for d in g2_cluster if d.needs_group(3) and d.dog_id not in used_dogs]
+            
+            # Find additional G1 dogs needed (respecting capacity)
+            available_g1 = [d for d in dogs_by_group[1] if d.dog_id not in used_dogs and d not in g2_cluster]
+            g1_slots_available = max(0, capacity - len(g1_from_g2))
+            target_g1_count = min(g1_slots_available, len(available_g1))
+            additional_g1 = self.find_nearby_dogs(
+                available_g1, g2_center_lat, g2_center_lng, 
+                target_count=target_g1_count
+            )
+            g1_candidates = g1_from_g2 + additional_g1
+            
+            # Ensure G1 doesn't exceed capacity
+            if len(g1_candidates) > capacity:
+                g1_candidates = g1_candidates[:capacity]
+            
+            # Find additional G3 dogs needed (respecting capacity)
+            available_g3 = [d for d in dogs_by_group[3] if d.dog_id not in used_dogs and d not in g2_cluster]
+            g3_slots_available = max(0, capacity - len(g3_from_g2))
+            target_g3_count = min(g3_slots_available, len(available_g3))
+            additional_g3 = self.find_nearby_dogs(
+                available_g3, g2_center_lat, g2_center_lng,
+                target_count=target_g3_count
+            )
+            g3_candidates = g3_from_g2 + additional_g3
+            
+            # Ensure G3 doesn't exceed capacity
+            if len(g3_candidates) > capacity:
+                g3_candidates = g3_candidates[:capacity]
+            
+            # Only create chain if it has at least one group with dogs
+            if g1_candidates or g2_cluster or g3_candidates:
+                chain = RouteChain(
+                    driver_id=f"Driver_{cluster_idx + 1:02d}",
+                    group1_dogs=g1_candidates,
+                    group2_dogs=g2_cluster,
+                    group3_dogs=g3_candidates
                 )
                 
-                if best_alt:
-                    # Connectivity score: higher = WORSE connectivity (better candidate to move)
-                    # Prioritize dogs with:
-                    # 1. High minimum distance to nearest neighbor (isolated)
-                    # 2. Few close neighbors
-                    # 3. Good alternative placement available
+                # Mark dogs as used (only mark each unique dog once)
+                unique_dogs = set()
+                for dog in chain.group1_dogs + chain.group2_dogs + chain.group3_dogs:
+                    unique_dogs.add(dog.dog_id)
+                used_dogs.update(unique_dogs)
+                
+                chains.append(chain)
+                
+                # Calculate transition efficiency
+                if chain.group1_dogs and chain.group2_dogs:
+                    g1_to_g2_avg = self.calculate_transition_distance(chain.group1_dogs, chain.group2_dogs)
+                else:
+                    g1_to_g2_avg = 0.0
                     
-                    connectivity_score = (
-                        min_distance * 10 +  # Weight minimum distance heavily
-                        (10 / (close_neighbors + 1)) +  # Inverse of close neighbors
-                        (5 / (very_close_neighbors + 1)) +  # Bonus for lacking very close neighbors
-                        (10 / (best_alt['time'] + 1))  # Better if good alternative exists
+                if chain.group2_dogs and chain.group3_dogs:
+                    g2_to_g3_avg = self.calculate_transition_distance(chain.group2_dogs, chain.group3_dogs)
+                else:
+                    g2_to_g3_avg = 0.0
+                
+                print(f"   ✅ Created chain: G1={len(chain.group1_dogs)}, "
+                      f"G2={len(chain.group2_dogs)}, G3={len(chain.group3_dogs)}")
+                if g1_to_g2_avg > 0 or g2_to_g3_avg > 0:
+                    print(f"   📍 Transition distances: G1→G2={g1_to_g2_avg:.1f}min, "
+                          f"G2→G3={g2_to_g3_avg:.1f}min")
+        
+        # Handle remaining dogs
+        remaining_dogs = [d for d in self.dogs if d.dog_id not in used_dogs]
+        if remaining_dogs:
+            print(f"\n⚠️  {len(remaining_dogs)} dogs not yet assigned - handling stragglers...")
+            self.handle_remaining_dogs(chains, remaining_dogs, used_dogs)
+        
+        return chains
+    
+    def build_chains_without_g2(self, dogs_by_group: Dict[int, List[Dog]]) -> List[RouteChain]:
+        """Alternative strategy when there are no Group 2 dogs"""
+        chains = []
+        used_dogs = set()
+        
+        # Try to pair G1 and G3 dogs geographically
+        if dogs_by_group[1] and dogs_by_group[3]:
+            g1_clusters = self.cluster_dogs_with_capacity(dogs_by_group[1], eps_minutes=2.0)
+            
+            for idx, g1_cluster in enumerate(g1_clusters):
+                # Find center of G1 cluster
+                center_lat = sum(d.lat for d in g1_cluster) / len(g1_cluster)
+                center_lng = sum(d.lng for d in g1_cluster) / len(g1_cluster)
+                
+                # Determine capacity based on G1 cluster density
+                capacity = self.STANDARD_CAPACITY
+                if len(g1_cluster) > 1:
+                    distances = []
+                    for i in range(min(5, len(g1_cluster))):
+                        for j in range(i + 1, min(5, len(g1_cluster))):
+                            dist = self.get_distance(g1_cluster[i], g1_cluster[j])
+                            if dist < float('inf'):
+                                distances.append(dist)
+                    
+                    if distances:
+                        avg_distance = sum(distances) / len(distances)
+                        capacity = self.DENSE_CAPACITY if avg_distance < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
+                
+                # Find nearby G3 dogs (respecting capacity)
+                available_g3 = [d for d in dogs_by_group[3] if d.dog_id not in used_dogs]
+                target_count = min(len(g1_cluster), capacity, len(available_g3))
+                g3_dogs = self.find_nearby_dogs(available_g3, center_lat, center_lng, target_count)
+                
+                chain = RouteChain(
+                    driver_id=f"Driver_{idx + 1:02d}",
+                    group1_dogs=g1_cluster,
+                    group2_dogs=[],
+                    group3_dogs=g3_dogs
+                )
+                
+                for dog in chain.group1_dogs + chain.group3_dogs:
+                    used_dogs.add(dog.dog_id)
+                
+                chains.append(chain)
+        
+        # Handle any G2 or G3 only dogs
+        remaining_g2 = [d for d in dogs_by_group.get(2, []) if d.dog_id not in used_dogs]
+        remaining_g3 = [d for d in dogs_by_group.get(3, []) if d.dog_id not in used_dogs]
+        
+        if remaining_g2 or remaining_g3:
+            # Cluster remaining dogs
+            if remaining_g2:
+                g2_clusters = self.cluster_dogs_with_capacity(remaining_g2, eps_minutes=2.0)
+                for idx, cluster in enumerate(g2_clusters):
+                    chain = RouteChain(
+                        driver_id=f"Driver_{len(chains) + idx + 1:02d}",
+                        group1_dogs=[],
+                        group2_dogs=cluster,
+                        group3_dogs=[]
                     )
+                    chains.append(chain)
+            
+            if remaining_g3:
+                g3_clusters = self.cluster_dogs_with_capacity(remaining_g3, eps_minutes=2.0)
+                for idx, cluster in enumerate(g3_clusters):
+                    chain = RouteChain(
+                        driver_id=f"Driver_{len(chains) + idx + 1:02d}",
+                        group1_dogs=[],
+                        group2_dogs=[],
+                        group3_dogs=cluster
+                    )
+                    chains.append(chain)
+        
+        return chains
+    
+    def handle_remaining_dogs(self, chains: List[RouteChain], remaining_dogs: List[Dog], used_dogs: Set[str]):
+        """Handle dogs that weren't assigned in the initial clustering"""
+        print("\n🔧 Handling remaining dogs...")
+        
+        for dog in remaining_dogs:
+            best_chain = None
+            best_score = float('inf')
+            
+            # Find best existing chain for this dog
+            for chain in chains:
+                # Calculate route density to determine capacity
+                all_chain_dogs = list(set(chain.group1_dogs + chain.group2_dogs + chain.group3_dogs))
+                if len(all_chain_dogs) > 1:
+                    distances = []
+                    for i in range(min(5, len(all_chain_dogs))):
+                        for j in range(i + 1, min(5, len(all_chain_dogs))):
+                            dist = self.get_distance(all_chain_dogs[i], all_chain_dogs[j])
+                            if dist < float('inf'):
+                                distances.append(dist)
                     
-                    dogs_with_connectivity.append({
-                        'dog': dog,
-                        'dog_name': dog_name,
-                        'min_distance': min_distance,
-                        'close_neighbors': close_neighbors,
-                        'very_close_neighbors': very_close_neighbors,
-                        'best_alt': best_alt,
-                        'score': connectivity_score
-                    })
-            
-            # Sort by connectivity score (worst connectivity = highest score = move first)
-            dogs_with_connectivity.sort(key=lambda x: -x['score'])
-            
-            if not dogs_with_connectivity:
-                print("\n   ❌ ERROR: No valid alternative placements found for any dogs!")
-                print("      All dogs may be too isolated or no other drivers have capacity.")
-                print("      Manual intervention required.")
-                # Skip to next over-capacity group
-                continue
-            
-            print("\nDogs ranked by connectivity (worst connected = move first):")
-            for i, dog_data in enumerate(dogs_with_connectivity[:10]):  # Show top 10
-                status = "→ MOVE" if i < dogs_to_move_count else ""
-                print(f"   {dog_data['dog_name']}: "
-                      f"nearest neighbor {dog_data['min_distance']:.1f} min, "
-                      f"{dog_data['close_neighbors']} neighbors <1min "
-                      f"{status}")
-            
-            # Move the required number of dogs
-            dogs_moved_this_iteration = 0
-            
-            for i in range(min(dogs_to_move_count, len(dogs_with_connectivity))):
-                dog_data = dogs_with_connectivity[i]
-                dog = dog_data['dog']
-                best_alt = dog_data['best_alt']
-                
-                # CRITICAL: Dogs keep their group numbers - only driver changes
-                old_combined = dog['combined']
-                original_groups = old_combined.split(':', 1)[1]
-                new_combined = f"{best_alt['driver']}:{original_groups}"
-                dog['combined'] = new_combined
-                
-                print(f"\n   ✅ Moved {dog_data['dog_name']}: {old_combined} → {new_combined}")
-                print(f"      Connectivity: nearest neighbor was {dog_data['min_distance']:.1f} min away")
-                print(f"      Had {dog_data['close_neighbors']} neighbors within 1 min")
-                print(f"      New group average: {best_alt['time']:.1f} min")
-                
-                moves_made += 1
-                dogs_moved_this_iteration += 1
-            
-            if dogs_moved_this_iteration == 0:
-                print("\n   ❌ ERROR: No dogs could be moved! Group will remain over capacity.")
-                print("      This may indicate all dogs are tightly connected.")
-                print("      Manual intervention may be needed.")
-                # Continue to next group instead of getting stuck
-                continue
-            
-            print(f"\n   Moved {dogs_moved_this_iteration} dogs this iteration")
-        
-        print(f"\n✅ Phase 6 Complete: {moves_made} moves made")
-        if moves_made > 0:
-            print("   (Moved dogs with worst connectivity to preserve route efficiency)")
-        return moves_made
-
-    def find_group_outliers(self, dogs):
-        """Find extreme outlier dogs in a group based on minimum distance to nearest neighbor
-        
-        Used by Phase 6 for capacity balancing.
-        A dog is an extreme outlier if it's > 5 min from its nearest neighbor.
-        (Phase 4 uses a different definition: > 1.5x average distance)
-        """
-        if len(dogs) < 2:
-            return []
-        
-        outliers = []
-        
-        for i, dog in enumerate(dogs):
-            dog_id = dog.get('dog_id', '')
-            if not dog_id:
-                continue
-            
-            # Find MINIMUM time to any other dog in group
-            min_time = float('inf')
-            times_to_others = []
-            
-            for j, other_dog in enumerate(dogs):
-                if i != j:
-                    other_id = other_dog.get('dog_id', '')
-                    if other_id:
-                        time_min = self.get_time_with_fallback(dog_id, other_id)
-                        if time_min < float('inf'):
-                            times_to_others.append(time_min)
-                            if time_min < min_time:
-                                min_time = time_min
-            
-            # A dog is an outlier if its nearest neighbor is far away
-            if min_time >= self.OUTLIER_THRESHOLD:
-                outliers.append({
-                    'dog': dog,
-                    'min_time_to_nearest': min_time,
-                    'avg_time': sum(times_to_others) / len(times_to_others) if times_to_others else float('inf')
-                })
-        
-        # Sort by minimum time to nearest neighbor (most isolated first)
-        outliers.sort(key=lambda x: -x['min_time_to_nearest'])
-        return outliers
-
-    def find_best_alternative_placement(self, dog, current_group, current_driver):
-        """Find best alternative placement for a dog - SAME GROUP ONLY"""
-        dog_id = dog.get('dog_id', '')
-        if not dog_id:
-            return None
-        
-        best_options = []
-        
-        # Check all other drivers for the SAME group only
-        for driver in self.active_drivers:
-            if driver == current_driver:
-                continue
-            
-            # Get capacity info for this driver
-            capacity_info = self.calculate_driver_density(driver)
-            capacity = capacity_info['capacity']
-            
-            # Count current dogs in the SAME group for this driver
-            group_count = 0
-            group_dogs = []
-            
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                    groups = self.parse_dog_groups_from_callout(assignment['combined'].split(':', 1)[1])
-                    if current_group in groups:
-                        group_count += 1
-                        group_dogs.append(assignment)
-            
-            # Check if there's capacity
-            if group_count >= capacity:
-                continue
-            
-            # Calculate average time to dogs in this group
-            if not group_dogs:
-                avg_time = 10.0  # Default for empty groups
-            else:
-                times = []
-                for other_dog in group_dogs:
-                    other_id = other_dog.get('dog_id', '')
-                    if other_id:
-                        time_min = self.get_time_with_fallback(dog_id, other_id)
-                        if time_min < float('inf'):
-                            times.append(time_min)
-                
-                if times:
-                    avg_time = sum(times) / len(times)
+                    if distances:
+                        avg_distance = sum(distances) / len(distances)
+                        capacity = self.DENSE_CAPACITY if avg_distance < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
+                    else:
+                        capacity = self.STANDARD_CAPACITY
                 else:
-                    avg_time = 10.0
-            
-            best_options.append({
-                'driver': driver,
-                'group': current_group,  # Always same group
-                'time': avg_time,
-                'capacity_remaining': capacity - group_count
-            })
-        
-        if not best_options:
-            return None
-        
-        # Sort options by time, but consider capacity within threshold
-        best_options.sort(key=lambda x: x['time'])
-        
-        # If multiple options are within CAPACITY_THRESHOLD minutes, prefer the one with more capacity
-        best_time = best_options[0]['time']
-        close_options = [opt for opt in best_options if opt['time'] <= best_time + self.CAPACITY_THRESHOLD]
-        
-        if len(close_options) > 1:
-            close_options.sort(key=lambda x: -x['capacity_remaining'])
-        
-        return close_options[0] if close_options else best_options[0]
-
-    def phase7_balance_driver_workload(self):
-        """PHASE 7 (was 6): Balance workload between drivers to even out dog counts
-        
-        Moves dogs from overloaded to underloaded drivers.
-        Only moves if it adds ≤ 2 minutes to the route.
-        Dogs stay in their assigned groups (1, 2, 3).
-        """
-        print("\n⚖️ PHASE 7: Balancing driver workloads")
-        print("=" * 60)
-        
-        # Calculate current capacity for each driver
-        driver_loads = {}
-        driver_dogs_by_group = defaultdict(lambda: defaultdict(list))
-        
-        for driver in self.active_drivers:
-            total_dogs = 0
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                    total_dogs += 1
-                    # Track dogs by group for this driver
-                    combined = assignment['combined']
-                    groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
-                    for group in groups:
-                        driver_dogs_by_group[driver][group].append(assignment)
-            
-            driver_loads[driver] = total_dogs
-        
-        if not driver_loads:
-            print("❌ No active drivers to balance")
-            return 0
-        
-        # Find average load - with safety check
-        total_dogs = sum(driver_loads.values())
-        if total_dogs == 0:
-            print("❌ No dogs assigned to any drivers")
-            return 0
-            
-        avg_load = total_dogs / len(driver_loads)
-        
-        print(f"📊 Current driver loads:")
-        for driver, load in sorted(driver_loads.items(), key=lambda x: -x[1]):
-            deviation = load - avg_load
-            indicator = "🔴" if deviation > 3 else "🟡" if deviation > 1 else "🟢"
-            print(f"   {driver}: {load} dogs ({deviation:+.1f} from avg) {indicator}")
-        
-        print(f"\n🎯 Target average: {avg_load:.1f} dogs per driver")
-        
-        # Find overloaded and underloaded drivers
-        overloaded = [(d, load) for d, load in driver_loads.items() if load > avg_load + 1]
-        underloaded = [(d, load) for d, load in driver_loads.items() if load < avg_load - 1]
-        
-        if not overloaded or not underloaded:
-            print("✅ Workload is already well balanced!")
-            return 0
-        
-        moves_made = 0
-        max_moves = 10  # Limit to prevent excessive changes
-        
-        # Try to move dogs from overloaded to underloaded drivers
-        for over_driver, over_load in sorted(overloaded, key=lambda x: -x[1]):
-            if moves_made >= max_moves:
-                break
+                    capacity = self.STANDARD_CAPACITY
                 
-            for under_driver, under_load in sorted(underloaded, key=lambda x: x[1]):
-                if moves_made >= max_moves:
-                    break
-                    
-                if driver_loads[over_driver] <= avg_load + 0.5:
-                    break  # This driver is now balanced
+                # Check if chain has room for this dog in the groups it needs
+                can_add_to_g1 = dog.needs_group(1) and len(chain.group1_dogs) < capacity
+                can_add_to_g2 = dog.needs_group(2) and len(chain.group2_dogs) < capacity
+                can_add_to_g3 = dog.needs_group(3) and len(chain.group3_dogs) < capacity
                 
-                print(f"\n🔍 Checking moves from {over_driver} ({driver_loads[over_driver]} dogs) "
-                      f"to {under_driver} ({driver_loads[under_driver]} dogs)")
+                # Dog must be able to fit in ALL groups it needs
+                can_add = True
+                if dog.needs_group(1) and not can_add_to_g1:
+                    can_add = False
+                if dog.needs_group(2) and not can_add_to_g2:
+                    can_add = False
+                if dog.needs_group(3) and not can_add_to_g3:
+                    can_add = False
                 
-                # Look for dogs that could be moved within same group
-                best_move = None
-                best_added_time = float('inf')
-                
-                # Check each group
-                for group_num in [1, 2, 3]:
-                    over_dogs = driver_dogs_by_group[over_driver][group_num]
-                    under_dogs = driver_dogs_by_group[under_driver][group_num]
-                    
-                    if not over_dogs:
-                        continue
-                    
-                    # Check capacity for underloaded driver
-                    capacity_info = self.calculate_driver_density(under_driver)
-                    capacity = capacity_info['capacity']
-                    
-                    if len(under_dogs) >= capacity:
-                        continue  # No room in this group
-                    
-                    # Find best dog to move from this group
-                    for dog in over_dogs:
-                        dog_id = dog.get('dog_id', '')
-                        if not dog_id:
-                            continue
-                        
-                        # Calculate how much time this would add to under_driver's route
-                        if not under_dogs:
-                            added_time = 0  # First dog in group
-                        else:
-                            times = []
-                            for other_dog in under_dogs:
-                                other_id = other_dog.get('dog_id', '')
-                                if other_id:
-                                    time_min = self.get_time_with_fallback(dog_id, other_id)
-                                    if time_min < float('inf'):
-                                        times.append(time_min)
-                            
-                            added_time = min(times) if times else 0
-                        
-                        # Only consider if it adds less than 2 minutes
-                        if added_time <= 2:
-                            if added_time < best_added_time:
-                                best_added_time = added_time
-                                best_move = {
-                                    'dog': dog,
-                                    'group': group_num,
-                                    'added_time': added_time,
-                                    'from_driver': over_driver,
-                                    'to_driver': under_driver
-                                }
-                
-                # Make the best move if found
-                if best_move:
-                    dog = best_move['dog']
-                    dog_name = dog.get('dog_name', 'Unknown')
-                    
-                    # CRITICAL: Update assignment - KEEP SAME GROUP NUMBER
-                    # Dogs CANNOT change groups (1, 2, 3) - only drivers
-                    original_groups = dog['combined'].split(':', 1)[1]
-                    dog['combined'] = f"{best_move['to_driver']}:{original_groups}"
-                    
-                    # Update tracking
-                    driver_loads[best_move['from_driver']] -= 1
-                    driver_loads[best_move['to_driver']] += 1
-                    
-                    # Update group tracking - with safety check
-                    try:
-                        driver_dogs_by_group[over_driver][best_move['group']].remove(dog)
-                    except (ValueError, KeyError):
-                        # Dog might have been moved by previous phase
-                        pass
-                    driver_dogs_by_group[under_driver][best_move['group']].append(dog)
-                    
-                    print(f"   ✅ Moved {dog_name} (Group {best_move['group']}) "
-                          f"from {best_move['from_driver']} to {best_move['to_driver']} "
-                          f"(+{best_move['added_time']:.1f} min)")
-                    moves_made += 1
-                else:
-                    print(f"   ❌ No suitable moves found (all would add > 2 min)")
-        
-        # Final summary
-        print(f"\n📊 Final driver loads:")
-        for driver, load in sorted(driver_loads.items(), key=lambda x: -x[1]):
-            deviation = load - avg_load
-            indicator = "🔴" if deviation > 3 else "🟡" if deviation > 1 else "🟢"
-            print(f"   {driver}: {load} dogs ({deviation:+.1f} from avg) {indicator}")
-        
-        print(f"\n✅ Phase 7 Complete: {moves_made} moves made to balance workload")
-        return moves_made
-
-    def optimize_routes(self):
-        """Main optimization function following the new strategy"""
-        print("\n🚀 STARTING NEW OPTIMIZATION STRATEGY (7 PHASES)")
-        print("=" * 60)
-        
-        # Phase 1: Assign all callouts (ignore capacity)
-        callouts_assigned = self.phase1_assign_all_callouts()
-        
-        # Phase 2: Consolidate small drivers
-        dogs_consolidated = self.phase2_consolidate_small_drivers()
-        
-        # Phase 3: Cluster nearby dogs (< 1 minute)
-        cluster_moves = self.phase3_cluster_nearby_dogs()
-        
-        # Phase 4: Remove outliers from ALL groups
-        outlier_moves = self.phase4_remove_outliers_all_groups()
-        
-        # Phase 5: Consolidate small groups (Group 1 or 3 with < 4 dogs)
-        small_group_moves = self.phase5_consolidate_small_groups()
-        
-        # Phase 6: Balance capacity
-        capacity_moves = self.phase6_balance_capacity()
-        
-        # Phase 7: Balance driver workloads
-        workload_moves = self.phase7_balance_driver_workload()
-        
-        # Summary
-        print("\n" + "=" * 60)
-        print("📊 OPTIMIZATION COMPLETE - 7 PHASES")
-        print("=" * 60)
-        print(f"✅ Phase 1: {callouts_assigned} callouts assigned")
-        print(f"✅ Phase 2: {dogs_consolidated} dogs consolidated")
-        print(f"✅ Phase 3: {cluster_moves} dogs clustered with neighbors")
-        print(f"✅ Phase 4: {outlier_moves} outliers moved to better groups")
-        print(f"✅ Phase 5: {small_group_moves} dogs moved from small groups")
-        print(f"✅ Phase 6: {capacity_moves} capacity balancing moves")
-        print(f"✅ Phase 7: {workload_moves} workload balancing moves")
-        print(f"✅ Active drivers: {len(self.active_drivers)}")
-        
-        return callouts_assigned + dogs_consolidated + cluster_moves + outlier_moves + small_group_moves + capacity_moves + workload_moves
-
-    def analyze_within_group_times(self):
-        """Analyze driving times between dogs within same driver AND same group"""
-        print("\n🔍 WITHIN-GROUP TIME ANALYSIS")
-        print("=" * 50)
-        
-        max_time = 0
-        max_info = None
-        group_stats = []
-        
-        for driver in self.active_drivers:
-            print(f"\nDriver: {driver}")
-            print("=" * (8 + len(driver)))
-            
-            # Get all dogs for this driver
-            driver_dogs = []
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
-                    driver_dogs.append(assignment)
-            
-            if not driver_dogs:
-                print("  No dogs assigned")
-                continue
-            
-            # Group dogs by their group numbers
-            groups = defaultdict(list)
-            for dog in driver_dogs:
-                combined = dog.get('combined', '')
-                if ':' in combined:
-                    groups_part = combined.split(':', 1)[1]
-                    dog_groups = self.parse_dog_groups_from_callout(groups_part)
-                    for g in dog_groups:
-                        groups[g].append(dog)
-            
-            # Group capacity indicator
-            capacity_info = self.calculate_driver_density(driver)
-            capacity = capacity_info['capacity']
-            is_dense = capacity_info['is_dense']
-            avg_route_time = capacity_info['avg_time']
-            
-            print(f"  Route density: {avg_route_time:.1f} min avg → Capacity: {capacity} "
-                  f"{'(DENSE)' if is_dense else '(STANDARD)'}")
-            
-            # Analyze each group
-            for group_num in sorted(groups.keys()):
-                dogs = groups[group_num]
-                if len(dogs) < 2:
-                    print(f"  Group {group_num}: {len(dogs)} dog{'s' if len(dogs) != 1 else ''} "
-                          f"(no times to calculate)")
+                if not can_add:
                     continue
                 
-                times = []
-                for i in range(len(dogs)):
-                    for j in range(i+1, len(dogs)):
-                        time_min = self.get_time_with_fallback(
-                            dogs[i].get('dog_id', ''), 
-                            dogs[j].get('dog_id', '')
-                        )
-                        if time_min < float('inf'):
-                            times.append(time_min)
-                            if time_min > max_time:
-                                max_time = time_min
-                                max_info = (driver, group_num, dogs[i].get('dog_name', ''), 
-                                          dogs[j].get('dog_name', ''))
+                # Calculate average distance to relevant groups
+                total_distance = 0
+                count = 0
                 
-                if times:
-                    avg = sum(times) / len(times)
-                    min_time = min(times)
-                    max_time_group = max(times)
+                if dog.needs_group(1) and chain.group1_dogs:
+                    for other_dog in chain.group1_dogs[:5]:  # Check first 5 for efficiency
+                        total_distance += self.get_distance(dog, other_dog)
+                        count += 1
+                
+                if dog.needs_group(2) and chain.group2_dogs:
+                    for other_dog in chain.group2_dogs[:5]:
+                        total_distance += self.get_distance(dog, other_dog)
+                        count += 1
+                
+                if dog.needs_group(3) and chain.group3_dogs:
+                    for other_dog in chain.group3_dogs[:5]:
+                        total_distance += self.get_distance(dog, other_dog)
+                        count += 1
+                
+                if count > 0:
+                    avg_distance = total_distance / count
+                    if avg_distance < best_score:
+                        best_score = avg_distance
+                        best_chain = chain
+            
+            # Add to best chain
+            if best_chain and best_score < 10.0:  # Only if reasonably close
+                if dog.needs_group(1):
+                    best_chain.group1_dogs.append(dog)
+                if dog.needs_group(2):
+                    best_chain.group2_dogs.append(dog)
+                if dog.needs_group(3):
+                    best_chain.group3_dogs.append(dog)
+                
+                used_dogs.add(dog.dog_id)
+                print(f"   ✅ Added {dog.name} to {best_chain.driver_id} (distance: {best_score:.1f}min)")
+            else:
+                # Create new chain if no suitable existing chain
+                if best_score >= 10.0 or best_chain is None:
+                    new_chain_idx = len(chains) + 1
+                    new_chain = RouteChain(
+                        driver_id=f"Driver_{new_chain_idx:02d}",
+                        group1_dogs=[dog] if dog.needs_group(1) else [],
+                        group2_dogs=[dog] if dog.needs_group(2) else [],
+                        group3_dogs=[dog] if dog.needs_group(3) else []
+                    )
+                    chains.append(new_chain)
+                    used_dogs.add(dog.dog_id)
+                    print(f"   ✅ Created new chain {new_chain.driver_id} for {dog.name}")
+    
+    def cluster_dogs_with_capacity(self, dogs: List[Dog], eps_minutes: float = 2.0) -> List[List[Dog]]:
+        """Cluster dogs using DBSCAN with capacity limits"""
+        if not dogs:
+            return []
+        
+        # First, get initial clusters without capacity limits
+        initial_clusters = self.cluster_dogs_dbscan(dogs, eps_minutes)
+        
+        # Now split clusters that exceed capacity
+        final_clusters = []
+        
+        for cluster in initial_clusters:
+            if not cluster:  # Skip empty clusters
+                continue
+                
+            if len(cluster) <= self.STANDARD_CAPACITY:
+                # Small enough for standard capacity
+                final_clusters.append(cluster)
+            else:
+                # Check if this is a dense cluster
+                capacity = self.STANDARD_CAPACITY  # Default
+                
+                if len(cluster) > 1:
+                    distances = []
+                    # Sample distances to avoid O(n²) for large clusters
+                    sample_size = min(20, len(cluster))
+                    for i in range(sample_size):
+                        for j in range(i + 1, sample_size):
+                            try:
+                                dist = self.get_distance(cluster[i], cluster[j])
+                                if dist < float('inf'):
+                                    distances.append(dist)
+                            except Exception:
+                                continue
                     
-                    # Visual indicator
-                    if avg < 2:
-                        indicator = "✅"
-                    elif avg < 5:
-                        indicator = "⚠️"
-                    else:
-                        indicator = "🚨"
+                    if distances:
+                        avg_distance = sum(distances) / len(distances)
+                        capacity = self.DENSE_CAPACITY if avg_distance < self.DENSE_THRESHOLD else self.STANDARD_CAPACITY
+                
+                # Split cluster if it exceeds capacity
+                if len(cluster) <= capacity:
+                    final_clusters.append(cluster)
+                else:
+                    # Split into capacity-sized chunks, keeping nearby dogs together
+                    # Sort dogs by location to keep geographic proximity
+                    try:
+                        # Simple geographic sort by latitude then longitude
+                        sorted_cluster = sorted(cluster, key=lambda d: (d.lat, d.lng))
+                    except Exception:
+                        sorted_cluster = cluster
                     
-                    # Capacity pressure indicator
-                    capacity_pct = (len(dogs) / capacity) * 100
-                    if capacity_pct >= 100:
-                        capacity_indicator = "🔴 OVER"
-                    elif capacity_pct >= 87.5:
-                        capacity_indicator = "🟡 NEAR"
-                    else:
-                        capacity_indicator = "🟢 GOOD"
+                    for i in range(0, len(sorted_cluster), capacity):
+                        final_clusters.append(sorted_cluster[i:i + capacity])
+        
+        return final_clusters
+    
+    def cluster_dogs_dbscan(self, dogs: List[Dog], eps_minutes: float = 2.0) -> List[List[Dog]]:
+        """Cluster dogs using DBSCAN based on driving time"""
+        if not dogs:
+            return []
+        
+        if len(dogs) == 1:
+            # Single dog becomes its own cluster
+            return [dogs]
+        
+        if len(dogs) == 2:
+            # Two dogs - check if they should cluster together
+            dist = self.get_distance(dogs[0], dogs[1])
+            if dist <= eps_minutes:
+                return [dogs]  # One cluster with both
+            else:
+                return [[dogs[0]], [dogs[1]]]  # Two separate clusters
+        
+        # For 3+ dogs, use DBSCAN
+        n = len(dogs)
+        distances = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    distances[i][j] = self.get_distance(dogs[i], dogs[j])
+        
+        # Run DBSCAN with min_samples=2 for small datasets
+        min_samples = min(3, max(2, n // 4))  # Adaptive min_samples
+        clustering = DBSCAN(eps=eps_minutes, min_samples=min_samples, metric='precomputed')
+        labels = clustering.fit_predict(distances)
+        
+        # Group dogs by cluster
+        clusters = defaultdict(list)
+        outliers = []
+        
+        for dog, label in zip(dogs, labels):
+            if label != -1:  # -1 means noise/outlier
+                clusters[label].append(dog)
+            else:
+                outliers.append(dog)
+        
+        # Handle outliers by assigning to nearest cluster or creating new ones
+        for outlier in outliers:
+            best_cluster = None
+            best_distance = float('inf')
+            
+            for label, cluster_dogs in clusters.items():
+                if not cluster_dogs:  # Skip empty clusters
+                    continue
                     
-                    print(f"  Group {group_num}: {len(dogs)}/{capacity} dogs ({capacity_pct:.0f}% {capacity_indicator})")
-                    print(f"    Average time: {avg:.1f} minutes {indicator}")
-                    print(f"    Min time: {min_time:.1f} minutes")
-                    print(f"    Max time: {max_time_group:.1f} minutes")
+                # Calculate average distance to dogs in this cluster
+                total_dist = 0
+                count = 0
+                for dog in cluster_dogs[:5]:  # Sample for efficiency
+                    dist = self.get_distance(outlier, dog)
+                    if dist < float('inf'):
+                        total_dist += dist
+                        count += 1
+                
+                if count > 0:
+                    avg_distance = total_dist / count
+                    if avg_distance < best_distance and avg_distance <= 5.0:
+                        best_distance = avg_distance
+                        best_cluster = label
+            
+            if best_cluster is not None:
+                clusters[best_cluster].append(outlier)
+            else:
+                # Create new cluster for distant outlier
+                new_label = max(clusters.keys()) + 1 if clusters else 0
+                clusters[new_label] = [outlier]
+        
+        # Convert to list and filter out empty clusters
+        return [dogs for dogs in clusters.values() if dogs]
+    
+    def find_nearby_dogs(self, candidates: List[Dog], center_lat: float, 
+                        center_lng: float, target_count: int) -> List[Dog]:
+        """Find the nearest dogs to a geographic center"""
+        if not candidates:
+            return []
+        
+        # Limit target count to available candidates
+        target_count = min(target_count, len(candidates))
+        if target_count <= 0:
+            return []
+        
+        # Calculate distances from center using haversine directly
+        dogs_with_distance = []
+        for dog in candidates:
+            # Direct haversine calculation to avoid matrix lookup issues
+            try:
+                lat1, lon1 = math.radians(center_lat), math.radians(center_lng)
+                lat2, lon2 = math.radians(dog.lat), math.radians(dog.lng)
+                
+                dlat = lat2 - lat1
+                dlon = lon2 - lon1
+                a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+                a = max(0.0, min(1.0, a))
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+                
+                distance_miles = 3959 * c
+                driving_minutes = distance_miles * 1.3 * 2.5
+                
+                dogs_with_distance.append((dog, driving_minutes))
+            except Exception:
+                # If calculation fails, use a high distance
+                dogs_with_distance.append((dog, 999.0))
+        
+        # Sort by distance and take target_count
+        dogs_with_distance.sort(key=lambda x: x[1])
+        selected = [dog for dog, _ in dogs_with_distance[:target_count]]
+        
+        return selected
+    
+    def calculate_transition_distance(self, from_dogs: List[Dog], to_dogs: List[Dog]) -> float:
+        """Calculate average transition distance between groups"""
+        if not from_dogs or not to_dogs:
+            return 0.0
+        
+        total_distance = 0
+        count = 0
+        
+        # For each from_dog, find distance to nearest to_dog
+        for from_dog in from_dogs:
+            min_dist = float('inf')
+            for to_dog in to_dogs:
+                try:
+                    dist = self.get_distance(from_dog, to_dog)
+                    if dist < min_dist and dist < float('inf'):
+                        min_dist = dist
+                except Exception as e:
+                    print(f"⚠️  Error calculating distance: {e}")
+                    continue
+            
+            if min_dist < float('inf'):
+                total_distance += min_dist
+                count += 1
+        
+        return total_distance / count if count > 0 else 0.0
+    
+    def optimize_chains(self, chains: List[RouteChain]) -> List[RouteChain]:
+        """Optimize chains for balance and efficiency"""
+        print("\n⚖️  Optimizing chains for balance...")
+        
+        if not chains:
+            print("   No chains to optimize")
+            return chains
+        
+        # Calculate current statistics
+        total_dogs = 0
+        for chain in chains:
+            if chain:
+                total_dogs += chain.total_dogs
+        
+        if len(chains) == 0:
+            avg_dogs_per_driver = 0
+        else:
+            avg_dogs_per_driver = total_dogs / len(chains)
+        
+        print(f"📊 Average dogs per driver: {avg_dogs_per_driver:.1f}")
+        
+        # TODO: Could implement more sophisticated balancing here
+        # For now, chains are already well-balanced from clustering
+        
+        return chains
+    
+    def generate_assignments(self) -> Dict[str, str]:
+        """Generate final assignments in format needed for Google Sheets"""
+        assignments = {}
+        
+        for chain in self.routes:
+            # Track which dogs we've already assigned for this driver
+            assigned_for_driver = set()
+            
+            # Collect all unique dogs in this chain
+            all_chain_dogs = {}  # dog_id -> dog object
+            
+            for dog in chain.group1_dogs:
+                all_chain_dogs[dog.dog_id] = dog
+            for dog in chain.group2_dogs:
+                all_chain_dogs[dog.dog_id] = dog
+            for dog in chain.group3_dogs:
+                all_chain_dogs[dog.dog_id] = dog
+            
+            # Create assignment for each unique dog
+            for dog_id, dog in all_chain_dogs.items():
+                # Build the group string from dog's original needs
+                group_parts = [str(g) for g in sorted(dog.groups_needed)]
+                group_string = ''.join(group_parts)
+                
+                assignment = f"{chain.driver_id}:{group_string}"
+                assignments[dog_id] = assignment
+        
+        return assignments
+    
+    def analyze_results(self):
+        """Analyze and display the optimization results"""
+        print("\n📊 OPTIMIZATION RESULTS")
+        print("=" * 60)
+        
+        if not self.routes:
+            print("❌ No routes created!")
+            return
+        
+        # Overall statistics
+        total_dogs_assigned = sum(chain.total_dogs for chain in self.routes)
+        total_drivers = len(self.routes)
+        
+        print(f"✅ Total drivers needed: {total_drivers}")
+        print(f"✅ Total dogs assigned: {total_dogs_assigned}/{len(self.dogs)}")
+        
+        if total_drivers > 0:
+            avg_dogs = total_dogs_assigned / total_drivers
+            print(f"✅ Average dogs per driver: {avg_dogs:.1f}")
+        
+        # Check for unassigned dogs
+        assigned_dog_ids = set()
+        for chain in self.routes:
+            for dog in chain.group1_dogs + chain.group2_dogs + chain.group3_dogs:
+                assigned_dog_ids.add(dog.dog_id)
+        
+        unassigned = [d for d in self.dogs if d.dog_id not in assigned_dog_ids]
+        if unassigned:
+            print(f"\n⚠️  {len(unassigned)} dogs not assigned:")
+            for dog in unassigned[:10]:  # Show first 10
+                print(f"   - {dog.name} (needs groups {dog.groups_needed})")
+        
+        # Detailed breakdown
+        print("\n📋 Driver Assignments:")
+        for chain in sorted(self.routes, key=lambda x: x.driver_id):
+            print(f"\n{chain.driver_id}:")
+            print(f"  Group 1: {len(chain.group1_dogs)} dogs", end="")
+            if 0 < len(chain.group1_dogs) < self.MIN_GROUP_SIZE:
+                print(" ⚠️  BELOW MINIMUM", end="")
+            print()
+            
+            print(f"  Group 2: {len(chain.group2_dogs)} dogs", end="")
+            if 0 < len(chain.group2_dogs) < self.MIN_GROUP_SIZE:
+                print(" ⚠️  BELOW MINIMUM", end="")
+            print()
+            
+            print(f"  Group 3: {len(chain.group3_dogs)} dogs", end="")
+            if 0 < len(chain.group3_dogs) < self.MIN_GROUP_SIZE:
+                print(" ⚠️  BELOW MINIMUM", end="")
+            print()
+            
+            print(f"  Total unique dogs: {chain.total_dogs}")
+            
+            # Calculate route statistics
+            all_dogs_list = []
+            seen_ids = set()
+            for dog in chain.group1_dogs + chain.group2_dogs + chain.group3_dogs:
+                if dog.dog_id not in seen_ids:
+                    all_dogs_list.append(dog)
+                    seen_ids.add(dog.dog_id)
+            
+            if len(all_dogs_list) > 1:
+                distances = []
+                for i in range(len(all_dogs_list)):
+                    for j in range(i + 1, len(all_dogs_list)):
+                        dist = self.get_distance(all_dogs_list[i], all_dogs_list[j])
+                        if dist < float('inf'):
+                            distances.append(dist)
+                
+                if distances:
+                    avg_dist = sum(distances) / len(distances)
+                    max_dist = max(distances)
+                    min_dist = min(distances)
+                    density = "DENSE" if avg_dist < self.DENSE_THRESHOLD else "STANDARD"
+                    capacity = self.DENSE_CAPACITY if density == "DENSE" else self.STANDARD_CAPACITY
                     
-                    # Store for summary
-                    group_stats.append({
-                        'driver': driver,
-                        'group': group_num,
-                        'dog_count': len(dogs),
-                        'avg_time': avg,
-                        'min_time': min_time,
-                        'max_time': max_time_group
-                    })
+                    print(f"  Route stats: avg={avg_dist:.1f}min, min={min_dist:.1f}min, max={max_dist:.1f}min")
+                    print(f"  Route type: {density} (capacity: {capacity})")
                     
-                    print(f"    Dogs in group:")
-                    for dog in dogs:
-                        dog_name = dog.get('dog_name', 'Unknown')
-                        dog_id = dog.get('dog_id', 'No ID')
-                        
-                        # Check if this dog is an outlier
-                        min_time_to_neighbor = float('inf')
-                        for other_dog in dogs:
-                            if other_dog != dog:
-                                other_id = other_dog.get('dog_id', '')
-                                if other_id and dog_id:
-                                    time_to_other = self.get_time_with_fallback(dog_id, other_id)
-                                    if time_to_other < min_time_to_neighbor:
-                                        min_time_to_neighbor = time_to_other
-                        
-                        # Determine status
-                        if min_time_to_neighbor >= self.OUTLIER_THRESHOLD:
-                            status = " ⚠️ EXTREME OUTLIER"
-                        elif min_time_to_neighbor < self.CLUSTER_THRESHOLD:
-                            status = " 🔗 CLUSTERED"
-                        else:
-                            # Check if it's a regular outlier using new aggressive rules
-                            if times and len(times) > 0:
-                                # Use more aggressive threshold
-                                threshold = min(avg * self.OUTLIER_MULTIPLIER, self.OUTLIER_ABSOLUTE)
-                                # Calculate this dog's average to others
-                                dog_times_to_others = []
-                                for other_dog in dogs:
-                                    if other_dog != dog:
-                                        other_id = other_dog.get('dog_id', '')
-                                        if other_id and dog_id:
-                                            time_to_other = self.get_time_with_fallback(dog_id, other_id)
-                                            if time_to_other < float('inf'):
-                                                dog_times_to_others.append(time_to_other)
-                                
-                                if dog_times_to_others:
-                                    avg_to_others = sum(dog_times_to_others) / len(dog_times_to_others)
-                                    if avg_to_others > threshold or min_time_to_neighbor > 3:
-                                        status = " ⚠️ OUTLIER"
-                                    else:
-                                        status = ""
-                                else:
-                                    status = ""
-                            else:
-                                status = ""
-                            
-                        print(f"      - {dog_name} (ID: {dog_id}){status}")
+                    # Check if over capacity
+                    for group_name, group_dogs, group_num in [
+                        ("Group 1", chain.group1_dogs, 1),
+                        ("Group 2", chain.group2_dogs, 2),
+                        ("Group 3", chain.group3_dogs, 3)
+                    ]:
+                        if len(group_dogs) > capacity:
+                            print(f"  ⚠️  {group_name} OVER CAPACITY: {len(group_dogs)}/{capacity}")
+            
+            # Transition efficiency
+            if chain.group1_dogs and chain.group2_dogs:
+                g1_to_g2 = self.calculate_transition_distance(chain.group1_dogs, chain.group2_dogs)
+                if g1_to_g2 > 0:
+                    print(f"  G1→G2 transition: {g1_to_g2:.1f}min avg")
+            
+            if chain.group2_dogs and chain.group3_dogs:
+                g2_to_g3 = self.calculate_transition_distance(chain.group2_dogs, chain.group3_dogs)
+                if g2_to_g3 > 0:
+                    print(f"  G2→G3 transition: {g2_to_g3:.1f}min avg")
         
         # Summary statistics
-        if group_stats:
-            print(f"\n📊 SUMMARY STATISTICS")
-            print("=" * 50)
-            
-            all_avgs = [stat['avg_time'] for stat in group_stats]
-            overall_avg = sum(all_avgs) / len(all_avgs)
-            
-            print(f"🎯 OVERALL AVERAGE TIME: {overall_avg:.1f} minutes")
-            
-            # Group-specific averages
-            group_averages = defaultdict(list)
-            for stat in group_stats:
-                group_averages[stat['group']].append(stat['avg_time'])
-            
-            print(f"\n🎯 AVERAGE TIMES BY GROUP:")
-            for group_num in sorted(group_averages.keys()):
-                group_avg = sum(group_averages[group_num]) / len(group_averages[group_num])
-                print(f"  Group {group_num}: {group_avg:.1f} minutes average")
-            
-            if max_info:
-                print(f"\n🚨 MAXIMUM TIME BETWEEN ANY TWO DOGS:")
-                print(f"  Driver: {max_info[0]}")
-                print(f"  Group: {max_info[1]}")
-                print(f"  Dogs: {max_info[2]} ↔ {max_info[3]}")
-                print(f"  Time: {max_time:.1f} minutes")
-            
-            # Problem groups
-            problem_groups = [stat for stat in group_stats if stat['avg_time'] > 2]
-            if problem_groups:
-                print(f"\n⚠️  GROUPS NEEDING ATTENTION (avg > 2 min):")
-                for stat in problem_groups:
-                    print(f"  {stat['driver']} Group {stat['group']}: "
-                          f"{stat['avg_time']:.1f} min avg, {stat['dog_count']} dogs")
-            
-            print(f"\n💡 OPTIMIZATION THRESHOLDS:")
-            print(f"   Cluster together: Dogs < {self.CLUSTER_THRESHOLD} min apart")
-            print(f"   Phase 4 outliers: Dogs > 1.5x avg OR > 3 min from avg")
-            print(f"   Phase 4 also catches: Dogs > 3 min from nearest neighbor")
-            print(f"   Phase 6 extreme outliers: Dogs > {self.OUTLIER_THRESHOLD} min from nearest neighbor")
-            print("   Small groups: Group 1 or 3 with < 4 dogs (Phase 5)")
-            print("   Driver consolidation: Drivers with < 12 total dogs")
+        print(f"\n📊 SUMMARY:")
+        print(f"  Drivers needed: {total_drivers}")
+        print(f"  Dogs assigned: {total_dogs_assigned}/{len(self.dogs)}")
+        
+        if total_drivers > 0:
+            avg_per_driver = total_dogs_assigned / total_drivers
+            print(f"  Average per driver: {avg_per_driver:.1f} dogs")
+        
+        if unassigned:
+            print(f"  ⚠️  Unassigned dogs: {len(unassigned)}")
         else:
-            print("\n📊 No group statistics available")
-
-    def write_results_to_sheets(self):
-        """Write the optimized assignments back to Google Sheets"""
+            print(f"  ✅ All dogs assigned!")
+        
+        # Check for remaining small groups
+        small_groups_remaining = 0
+        for chain in self.routes:
+            if chain:  # Safety check
+                if 0 < len(chain.group1_dogs or []) < self.MIN_GROUP_SIZE:
+                    small_groups_remaining += 1
+                if 0 < len(chain.group2_dogs or []) < self.MIN_GROUP_SIZE:
+                    small_groups_remaining += 1
+                if 0 < len(chain.group3_dogs or []) < self.MIN_GROUP_SIZE:
+                    small_groups_remaining += 1
+        
+        if small_groups_remaining > 0:
+            print(f"  ⚠️  {small_groups_remaining} groups still below minimum size")
+            print(f"     (Could not consolidate - may need manual adjustment)")
+    
+    def write_to_sheets(self, assignments: Dict[str, str]):
+        """Write assignments back to Google Sheets
+        
+        Fills in the Combined column (H) with optimized assignments like:
+        - Driver_01:123 (for a dog that needs all 3 groups)
+        - Driver_02:1 (for a dog that only needs group 1)
+        - Driver_03:23 (for a dog that needs groups 2 and 3)
+        """
         try:
-            print("\n💾 Writing results back to Google Sheets...")
-            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet(self.MAP_TAB)
+            print("\n💾 Writing results to Google Sheets...")
+            print("   (Filling in blank Combined column with optimized assignments)")
+            
+            sheet = self.gc.open_by_key(self.MAP_SHEET_ID).worksheet("Map")
+            
+            # Read all values to get row indices
+            all_values = sheet.get_all_values()
             
             updates = []
-            combined_col_idx = 8  # Column H (1-indexed)
+            combined_col = 'H'  # Column H for combined assignments
+            dog_id_col_idx = 9  # Column J for dog ID (0-indexed)
             
-            for assignment in self.dog_assignments:
-                if isinstance(assignment, dict):
-                    row_idx = assignment.get('row_index')
-                    combined = assignment.get('combined', '')
-                    
-                    if row_idx:
-                        cell_ref = f"{chr(ord('A') + combined_col_idx - 1)}{row_idx}"
+            # Build updates
+            updated_count = 0
+            for row_idx, row in enumerate(all_values[1:], 2):  # Start at row 2
+                if len(row) > dog_id_col_idx:
+                    dog_id = row[dog_id_col_idx].strip()
+                    if dog_id in assignments:
                         updates.append({
-                            'range': cell_ref,
-                            'values': [[combined]]
+                            'range': f'{combined_col}{row_idx}',
+                            'values': [[assignments[dog_id]]]
                         })
+                        updated_count += 1
             
+            # Batch update
             if updates:
-                # Batch update with rate limiting
+                print(f"   Updating {len(updates)} assignments...")
                 for i in range(0, len(updates), 25):
                     batch = updates[i:i+25]
                     for update in batch:
                         sheet.update(update['values'], update['range'])
-                        time.sleep(1)
-                    time.sleep(5)
-                    print(f"📊 Updated batch {i//25 + 1}/{(len(updates)-1)//25 + 1}")
+                        time.sleep(0.5)
+                    print(f"   📝 Updated batch {i//25 + 1}/{(len(updates)-1)//25 + 1}")
                 
-                print(f"✅ Updated {len(updates)} assignments in Google Sheets")
+                print(f"✅ Successfully wrote {len(updates)} assignments to Combined column")
             else:
-                print("ℹ️  No updates needed")
+                print("⚠️  No assignments to write - something may be wrong")
                 
         except Exception as e:
-            print(f"❌ Error writing to Google Sheets: {e}")
-
-    def send_slack_notification(self, total_changes):
-        """Send notification to Slack about optimization results"""
-        webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
-        if not webhook_url:
-            print("ℹ️  No Slack webhook configured")
-            return
-        
+            print(f"❌ Error writing to sheets: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def run_optimization(self):
+        """Main optimization process"""
         try:
-            active_drivers_count = len(self.active_drivers)
-            total_dogs = len(self.dog_assignments)
+            print("\n🚀 Starting chain-based optimization...")
             
-            # Calculate utilization
-            total_capacity = active_drivers_count * 8 * 3
-            utilization = (total_dogs / total_capacity * 100) if total_capacity > 0 else 0
+            if not self.dogs:
+                print("❌ No dogs to optimize!")
+                return
             
-            message = {
-                "text": f"🐕 Dog Assignment Optimization Complete",
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"*Dog Assignment Optimization Results*\n"
-                                   f"• Total changes: {total_changes}\n"
-                                   f"• Active drivers: {active_drivers_count}\n"
-                                   f"• Total dogs: {total_dogs}\n"
-                                   f"• Utilization: {utilization:.1f}%\n"
-                                   f"• Optimization strategy: Time-based (minutes)\n"
-                                   f"• 7-phase optimization with nearest neighbor capacity enforcement"
-                        }
-                    }
-                ]
-            }
+            # Build chains
+            self.routes = self.build_transition_aware_chains()
             
-            if hasattr(self, 'haversine_fallback_count') and self.haversine_fallback_count > 0:
-                message["blocks"][0]["text"]["text"] += f"\n• Time fallbacks used: {self.haversine_fallback_count}"
+            if not self.routes:
+                print("❌ Failed to build any routes!")
+                return
             
-            response = requests.post(webhook_url, json=message, timeout=10)
-            if response.status_code == 200:
-                print("✅ Slack notification sent")
-            else:
-                print(f"⚠️  Slack notification failed: {response.status_code}")
-                
+            # Consolidate small groups
+            self.routes = self.consolidate_small_groups(self.routes)
+            
+            # Optimize for balance
+            self.routes = self.optimize_chains(self.routes)
+            
+            # Analyze results
+            self.analyze_results()
+            
+            # Generate assignments
+            assignments = self.generate_assignments()
+            
+            if not assignments:
+                print("⚠️  No assignments generated - something went wrong")
+                return
+            
+            # Validate assignments cover all dogs
+            assigned_dogs = set(assignments.keys())
+            all_dog_ids = set(dog.dog_id for dog in self.dogs if dog and hasattr(dog, 'dog_id'))
+            unassigned = all_dog_ids - assigned_dogs
+            
+            if unassigned:
+                print(f"⚠️  WARNING: {len(unassigned)} dogs have no assignment!")
+                for dog_id in list(unassigned)[:10]:  # Show first 10
+                    print(f"     - {dog_id}")
+            
+            # Write to sheets
+            if assignments:
+                self.write_to_sheets(assignments)
+            
+            print("\n✅ Optimization complete!")
+            
         except Exception as e:
-            print(f"⚠️  Slack notification error: {e}")
+            print(f"\n❌ Error during optimization: {e}")
+            import traceback
+            traceback.print_exc()
 
 def main():
-    """Main execution function"""
+    """Main entry point"""
     try:
-        system = DogReassignmentSystem()
+        system = ChainBasedClusteringSystem()
+        
+        # Check if we have data
+        if not system.dogs:
+            print("❌ No dogs loaded. Please check your data source.")
+            return
+        
+        print(f"\n🐕 Ready to optimize {len(system.dogs)} dogs")
         
         # Check if running in GitHub Actions
         is_github_actions = os.environ.get('GITHUB_ACTIONS') == 'true'
         
         if is_github_actions:
-            choice = '1'
-            print("🤖 Running in GitHub Actions - auto-selecting option 1 (optimization)")
+            print("🤖 Running in GitHub Actions - proceeding with optimization")
+            system.run_optimization()
         else:
-            print("\nWhat would you like to do?")
-            print("1. Run optimization with new strategy")
-            print("2. Analyze within-group times only")
-            print("3. Both (analyze first, then optimize)")
-            choice = input("Enter choice (1/2/3): ").strip()
-        
-        total_changes = 0
-        
-        if choice in ['2', '3']:
-            system.analyze_within_group_times()
-        
-        if choice in ['1', '3']:
-            total_changes = system.optimize_routes()
-            system.write_results_to_sheets()
-        
-        if hasattr(system, 'haversine_fallback_count') and system.haversine_fallback_count > 0:
-            print(f"\n📍 Haversine Fallback Usage:")
-            print(f"   Used {system.haversine_fallback_count} times for time calculations")
-            print(f"   These represent dog pairs not in your time matrix")
-        
-        system.send_slack_notification(total_changes)
-        
-        print(f"\n🎉 Process completed successfully!")
+            # Interactive mode
+            print("\nOptions:")
+            print("1. Run optimization")
+            print("2. Analyze current data only")
+            print("3. Exit")
+            
+            choice = input("\nEnter choice (1-3): ").strip()
+            
+            if choice == '1':
+                system.run_optimization()
+            elif choice == '2':
+                # Just analyze without optimizing
+                if system.routes:
+                    system.analyze_results()
+                else:
+                    print("No routes to analyze. Run optimization first.")
+            elif choice == '3':
+                print("👋 Goodbye!")
+            else:
+                print("❌ Invalid choice")
         
     except KeyboardInterrupt:
-        print(f"\n⏹️  Process interrupted by user")
-        sys.exit(1)
+        print("\n⏹️  Process interrupted")
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        print(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
