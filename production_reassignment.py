@@ -1139,7 +1139,10 @@ class DogReassignmentSystem:
             
             # Check Group 1 and Group 3 for small size
             for group_num in [1, 3]:
-                if group_num in driver_groups and len(driver_groups[group_num]) < self.MIN_GROUP_SIZE:
+                if group_num not in driver_groups:
+                    continue
+                    
+                if len(driver_groups[group_num]) < self.MIN_GROUP_SIZE:
                     dogs_to_move = driver_groups[group_num]
                     print(f"\n📊 {driver} Group {group_num} has only {len(dogs_to_move)} dogs")
                     
@@ -1184,33 +1187,33 @@ class DogReassignmentSystem:
                                     other_group_dogs.append(assignment)
                             
                             available_capacity = capacity - len(other_group_dogs)
-                            if available_capacity <= 0:
-                                continue
                             
-                            # Find closest dog in other driver's group
-                            min_time = float('inf')
-                            closest_dog_name = None
-                            
-                            if other_group_dogs:  # Only if there are dogs to compare to
-                                for other_dog in other_group_dogs:
-                                    other_id = other_dog.get('dog_id', '')
-                                    if other_id and dog_id:
-                                        time = self.get_time_with_fallback(dog_id, other_id)
-                                        if time < min_time:
-                                            min_time = time
-                                            closest_dog_name = other_dog.get('dog_name', 'Unknown')
-                            else:
-                                # Empty group - use a default time
-                                min_time = 5.0  # Assume 5 minutes for empty groups
-                                closest_dog_name = "Empty group"
-                            
-                            if min_time < float('inf'):
-                                options.append({
-                                    'driver': other_driver,
-                                    'time': min_time,
-                                    'capacity': available_capacity,
-                                    'closest_dog': closest_dog_name
-                                })
+                            # Only process if there's capacity
+                            if available_capacity > 0:
+                                # Find closest dog in other driver's group
+                                min_time = float('inf')
+                                closest_dog_name = None
+                                
+                                if other_group_dogs:  # Only if there are dogs to compare to
+                                    for other_dog in other_group_dogs:
+                                        other_id = other_dog.get('dog_id', '')
+                                        if other_id and dog_id:
+                                            time = self.get_time_with_fallback(dog_id, other_id)
+                                            if time < min_time:
+                                                min_time = time
+                                                closest_dog_name = other_dog.get('dog_name', 'Unknown')
+                                else:
+                                    # Empty group - use a default time
+                                    min_time = 5.0  # Assume 5 minutes for empty groups
+                                    closest_dog_name = "Empty group"
+                                
+                                if min_time < float('inf'):
+                                    options.append({
+                                        'driver': other_driver,
+                                        'time': min_time,
+                                        'capacity': available_capacity,
+                                        'closest_dog': closest_dog_name
+                                    })
                         
             # Find all options within 1 minute of best
             if options:
