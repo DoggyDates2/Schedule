@@ -2,12 +2,13 @@
 """
 Dog Assignment Optimization System - REVISED PHASE ORDER
 
-NEW OPTIMIZATION STRATEGY (5 PHASES):
+NEW OPTIMIZATION STRATEGY (6 PHASES):
 1. Phase 1: Cluster nearby dogs FIRST (< 1 min apart) - before any assignments
 2. Phase 2: Remove outliers from existing assignments
 3. Phase 3: Assign callouts intelligently with capacity management
 4. Phase 4: Consolidate small drivers (< 7 total dogs)
 5. Phase 5: Consolidate small groups with constraints
+6. Phase 6: Final outlier sweep to clean up any remaining suboptimal assignments
 
 KEY IMPROVEMENTS:
 - Cluster BEFORE assigning (preserves natural groupings)
@@ -15,6 +16,7 @@ KEY IMPROVEMENTS:
 - Cascading logic for over-capacity situations
 - Weighted scoring for placement decisions
 - More conservative thresholds
+- Final cleanup phase to catch any remaining outliers
 """
 
 import os
@@ -44,7 +46,7 @@ class DogReassignmentSystem:
         print("   Standard routes: 8 dogs per group")
         print("   Small drivers: < 7 dogs get consolidated")
         print("   Small groups: < 4 dogs in Group 1 or 3 get consolidated")
-        print("   5-Phase optimization with clustering FIRST")
+        print("   6-Phase optimization with clustering FIRST and final sweep LAST")
         
         # Google Sheets IDs
         self.MAP_SHEET_ID = "1-KTOfTKXk_sX7nO7eGmW73JLi8TJBvv5gobK6gyrc7U"
@@ -845,9 +847,14 @@ class DogReassignmentSystem:
         while iteration < max_iterations:
             iteration += 1
             over_capacity_found = False
+            moves_this_iteration = 0
+            max_moves_per_iteration = 5  # Prevent runaway cascading
             
             # Find all over-capacity groups
             for driver in self.active_drivers:
+                if moves_this_iteration >= max_moves_per_iteration:
+                    break
+                    
                 capacity_info = self.calculate_driver_density(driver)
                 capacity = capacity_info['capacity']
                 
@@ -862,6 +869,9 @@ class DogReassignmentSystem:
                 
                 # Check each group
                 for group_num, dogs in driver_groups.items():
+                    if moves_this_iteration >= max_moves_per_iteration:
+                        break
+                        
                     if len(dogs) > capacity:
                         over_capacity_found = True
                         print(f"\n   ⚠️  {driver} Group {group_num}: {len(dogs)}/{capacity} dogs (over by {len(dogs) - capacity})")
@@ -936,9 +946,14 @@ class DogReassignmentSystem:
                                         moves_made += 1
                                         moved_dogs.add(dog_id)  # Track this move
                                         moved_this_group = True
+                                        moves_this_iteration += 1
                                         
                                         print(f"      ✅ Moved outlier {dog_name} to {best_alt['driver']} "
                                               f"({best_alt['time']:.1f} min)")
+                                        
+                                        if moves_this_iteration >= max_moves_per_iteration:
+                                            print(f"   ⚠️  Reached max moves per iteration ({max_moves_per_iteration})")
+                                            break
         
         if not over_capacity_found:
             print("   ✅ All groups within capacity")
@@ -1165,7 +1180,7 @@ class DogReassignmentSystem:
                                 if (isinstance(assignment, dict) and 
                                     assignment.get('combined', '').startswith(f"{other_driver}:") and
                                     group_num in self.parse_dog_groups_from_callout(
-                                        assignment['combined'].split(':', 1)[1])):
+                                        assignment.get('combined', '').split(':', 1)[1] if ':' in assignment.get('combined', '') else '')):
                                     other_group_dogs.append(assignment)
                             
                             available_capacity = capacity - len(other_group_dogs)
@@ -1176,13 +1191,18 @@ class DogReassignmentSystem:
                             min_time = float('inf')
                             closest_dog_name = None
                             
-                            for other_dog in other_group_dogs:
-                                other_id = other_dog.get('dog_id', '')
-                                if other_id and dog_id:
-                                    time = self.get_time_with_fallback(dog_id, other_id)
-                                    if time < min_time:
-                                        min_time = time
-                                        closest_dog_name = other_dog.get('dog_name', 'Unknown')
+                            if other_group_dogs:  # Only if there are dogs to compare to
+                                for other_dog in other_group_dogs:
+                                    other_id = other_dog.get('dog_id', '')
+                                    if other_id and dog_id:
+                                        time = self.get_time_with_fallback(dog_id, other_id)
+                                        if time < min_time:
+                                            min_time = time
+                                            closest_dog_name = other_dog.get('dog_name', 'Unknown')
+                            else:
+                                # Empty group - use a default time
+                                min_time = 5.0  # Assume 5 minutes for empty groups
+                                closest_dog_name = "Empty group"
                             
                             if min_time < float('inf'):
                                 options.append({
@@ -1225,7 +1245,253 @@ class DogReassignmentSystem:
         print(f"\n✅ Phase 5 Complete: {moves_made} dogs moved from small groups")
         return moves_made
 
-    def optimize_routes(self):
+    def phase6_final_outlier_sweep(self):
+        """NEW PHASE 6: Final sweep to clean up any remaining outliers
+        
+        Looks across ALL groups (not just over-capacity) to find outliers and move them to:
+        1. Groups with extra capacity that can easily absorb them
+        2. Drivers with neighboring dogs (better geographic fit)
+        
+        This is a final cleanup phase to catch any suboptimal assignments.
+        """
+        print("\n🧹 PHASE 6: Final outlier sweep across all groups")
+        print("=" * 60)
+        
+        moves_made = 0
+        all_outliers = []
+        
+        # Find all outliers across all drivers and groups
+        for driver in self.active_drivers:
+            driver_groups = defaultdict(list)
+            
+            for assignment in self.dog_assignments:
+                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
+                    combined = assignment.get('combined', '')
+                    if ':' in combined:
+                        groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
+                        for group in groups:
+                            driver_groups[group].append(assignment)
+            
+            # Check each group for outliers
+            for group_num, dogs in driver_groups.items():
+                if len(dogs) < 3:  # Need at least 3 dogs to identify outliers
+                    continue
+                
+                # Calculate average distance in group
+                all_distances = []
+                for i in range(len(dogs)):
+                    for j in range(i + 1, len(dogs)):
+                        dog1_id = dogs[i].get('dog_id', '')
+                        dog2_id = dogs[j].get('dog_id', '')
+                        if dog1_id and dog2_id:
+                            time_min = self.get_time_with_fallback(dog1_id, dog2_id)
+                            if time_min < float('inf'):
+                                all_distances.append(time_min)
+                
+                if not all_distances:
+                    continue
+                
+                avg_distance = sum(all_distances) / len(all_distances)
+                
+                # Find outliers in this group
+                for dog in dogs:
+                    dog_id = dog.get('dog_id', '')
+                    if not dog_id:
+                        continue
+                    
+                    # Ensure dog has a combined field
+                    if not dog.get('combined') or ':' not in dog.get('combined', ''):
+                        continue
+                    
+                    # Calculate metrics
+                    distances_to_others = []
+                    min_distance = float('inf')
+                    
+                    for other_dog in dogs:
+                        if other_dog != dog:
+                            other_id = other_dog.get('dog_id', '')
+                            if other_id:
+                                time_min = self.get_time_with_fallback(dog_id, other_id)
+                                if time_min < float('inf'):
+                                    distances_to_others.append(time_min)
+                                    min_distance = min(min_distance, time_min)
+                    
+                    if distances_to_others:
+                        avg_to_others = sum(distances_to_others) / len(distances_to_others)
+                        
+                        # More conservative criteria for final sweep
+                        is_outlier = (
+                            avg_to_others > avg_distance * 2 or  # > 2x average (more conservative)
+                            avg_to_others > 4 or                  # > 4 min absolute
+                            min_distance > 4                      # > 4 min to nearest
+                        )
+                        
+                        if is_outlier:
+                            all_outliers.append({
+                                'dog': dog,
+                                'current_driver': driver,
+                                'current_group': group_num,
+                                'avg_distance': avg_to_others,
+                                'min_distance': min_distance,
+                                'dog_name': dog.get('dog_name', 'Unknown'),
+                                'dog_id': dog_id,
+                                'group_avg': avg_distance,
+                                'severity': avg_to_others / avg_distance  # How bad is this outlier
+                            })
+        
+        if not all_outliers:
+            print("✅ No significant outliers found - assignments look good!")
+            return 0
+        
+        # Sort outliers by severity (worst first)
+        all_outliers.sort(key=lambda x: -x['severity'])
+        
+        print(f"🔍 Found {len(all_outliers)} outliers across all groups")
+        print("\nTop outliers:")
+        for outlier in all_outliers[:5]:
+            print(f"   - {outlier['dog_name']} ({outlier['current_driver']} G{outlier['current_group']}): "
+                  f"avg {outlier['avg_distance']:.1f} min, nearest {outlier['min_distance']:.1f} min "
+                  f"(severity: {outlier['severity']:.1f}x)")
+        
+        # Try to relocate outliers
+        for outlier_data in all_outliers:
+            dog = outlier_data['dog']
+            dog_id = outlier_data['dog_id']
+            current_driver = outlier_data['current_driver']
+            group_num = outlier_data['current_group']
+            
+            # Find all possible destinations
+            destinations = []
+            
+            for driver in self.active_drivers:
+                if driver == current_driver:
+                    continue
+                
+                # Get capacity info
+                capacity_info = self.calculate_driver_density(driver)
+                capacity = capacity_info['capacity']
+                
+                # Count current dogs in this group
+                current_count = sum(1 for a in self.dog_assignments
+                                  if isinstance(a, dict) and 
+                                  a.get('combined', '').startswith(f"{driver}:") and
+                                  group_num in self.parse_dog_groups_from_callout(
+                                      a.get('combined', '').split(':', 1)[1] if ':' in a.get('combined', '') else ''))
+                
+                available_capacity = capacity - current_count
+                
+                # Get dogs in same group for this driver
+                driver_group_dogs = []
+                for assignment in self.dog_assignments:
+                    if (isinstance(assignment, dict) and 
+                        assignment.get('combined', '').startswith(f"{driver}:") and
+                        group_num in self.parse_dog_groups_from_callout(
+                            assignment.get('combined', '').split(':', 1)[1] if ':' in assignment.get('combined', '') else '')):
+                        driver_group_dogs.append(assignment)
+                
+                if not driver_group_dogs and available_capacity <= 0:
+                    continue  # Skip if no dogs and no capacity
+                
+                # Calculate fit with this group
+                if driver_group_dogs:
+                    distances = []
+                    min_dist = float('inf')
+                    for other_dog in driver_group_dogs:
+                        other_id = other_dog.get('dog_id', '')
+                        if other_id and dog_id:
+                            time_min = self.get_time_with_fallback(dog_id, other_id)
+                            if time_min < float('inf'):
+                                distances.append(time_min)
+                                min_dist = min(min_dist, time_min)
+                    
+                    if distances:
+                        avg_dist = sum(distances) / len(distances)
+                        
+                        # Calculate improvement score
+                        improvement = outlier_data['avg_distance'] - avg_dist
+                        
+                        destinations.append({
+                            'driver': driver,
+                            'avg_distance': avg_dist,
+                            'min_distance': min_dist,
+                            'available_capacity': available_capacity,
+                            'improvement': improvement,
+                            'has_neighbors': True,
+                            'neighbor_count': len(driver_group_dogs)
+                        })
+                elif available_capacity > 2:  # Empty group with good capacity
+                    # Check if there are dogs nearby in other groups
+                    nearby_dogs = 0
+                    min_cross_group_dist = float('inf')
+                    
+                    for g in [1, 2, 3]:
+                        if g == group_num:
+                            continue
+                        for assignment in self.dog_assignments:
+                            if (isinstance(assignment, dict) and 
+                                assignment.get('combined', '').startswith(f"{driver}:") and
+                                g in self.parse_dog_groups_from_callout(
+                                    assignment.get('combined', '').split(':', 1)[1] if ':' in assignment.get('combined', '') else '')):
+                                other_id = assignment.get('dog_id', '')
+                                if other_id and dog_id:
+                                    time_min = self.get_time_with_fallback(dog_id, other_id)
+                                    if time_min < 3:  # Within 3 minutes
+                                        nearby_dogs += 1
+                                    min_cross_group_dist = min(min_cross_group_dist, time_min)
+                    
+                    if nearby_dogs > 0:
+                        destinations.append({
+                            'driver': driver,
+                            'avg_distance': min_cross_group_dist,
+                            'min_distance': min_cross_group_dist,
+                            'available_capacity': available_capacity,
+                            'improvement': outlier_data['avg_distance'] - min_cross_group_dist,
+                            'has_neighbors': False,
+                            'neighbor_count': 0,
+                            'nearby_in_other_groups': nearby_dogs
+                        })
+            
+            # Sort destinations by criteria
+            if destinations:
+                # Sort by: 1) significant improvement, 2) has neighbors, 3) capacity
+                destinations.sort(key=lambda x: (
+                    -max(x['improvement'], 0),  # Improvement (positive is better)
+                    -x['has_neighbors'],         # Prefer groups with existing dogs
+                    -x['available_capacity']     # Prefer groups with more space
+                ))
+                
+                # Only move if there's significant improvement
+                best_dest = destinations[0]
+                if best_dest['improvement'] > 1 and best_dest['avg_distance'] < outlier_data['avg_distance'] - 1:
+                    # Make the move
+                    combined = dog.get('combined', '')
+                    if ':' in combined:
+                        original_groups = combined.split(':', 1)[1]
+                        dog['combined'] = f"{best_dest['driver']}:{original_groups}"
+                        
+                        improvement_pct = (best_dest['improvement'] / outlier_data['avg_distance']) * 100 if outlier_data['avg_distance'] > 0 else 0
+                        
+                        print(f"\n✅ Moved outlier {outlier_data['dog_name']}:")
+                        print(f"   From: {current_driver} (avg {outlier_data['avg_distance']:.1f} min)")
+                        print(f"   To: {best_dest['driver']} (avg {best_dest['avg_distance']:.1f} min)")
+                        print(f"   Improvement: {best_dest['improvement']:.1f} min ({improvement_pct:.0f}% better)")
+                        if not best_dest['has_neighbors']:
+                            print(f"   Note: First dog in this group, but has {best_dest.get('nearby_in_other_groups', 0)} "
+                                  f"dogs nearby in other groups")
+                        
+                        moves_made += 1
+                        
+                        # Stop after moving 10 outliers to avoid over-optimization
+                        if moves_made >= 10:
+                            print(f"\n📊 Moved {moves_made} outliers - stopping to avoid over-optimization")
+                            break
+        
+        if moves_made == 0 and all_outliers:
+            print("\n📊 Found outliers but no significantly better placements available")
+            print("   (Would need to compromise other objectives to improve further)")
+        
+        print(f"\n✅ Phase 6 Complete: {moves_made} outliers relocated")
+        return moves_made
         """Main optimization function with revised phase order"""
         print("\n🚀 STARTING REVISED OPTIMIZATION STRATEGY (5 PHASES)")
         print("=" * 60)
@@ -1530,7 +1796,7 @@ class DogReassignmentSystem:
                                    f"• Total dogs: {total_dogs}\n"
                                    f"• Utilization: {utilization:.1f}%\n"
                                    f"• Optimization strategy: Time-based (minutes)\n"
-                                   f"• 5-phase optimization with clustering FIRST"
+                                   f"• 6-phase optimization with clustering FIRST and final sweep LAST"
                         }
                     }
                 ]
