@@ -1142,6 +1142,165 @@ class DogReassignmentSystem:
                 if group_num not in driver_groups:
                     continue
                     
+                if len(driver_groups[group_num]) >= self.MIN_GROUP_SIZE:
+                    continue
+                    
+                dogs_to_move = driver_groups[group_num]
+                print(f"\n📊 {driver} Group {group_num} has only {len(dogs_to_move)} dogs")
+                
+                # Calculate current total drive time for this group
+                current_total_time = 0
+                for i in range(len(dogs_to_move)):
+                    for j in range(i + 1, len(dogs_to_move)):
+                        dog1_id = dogs_to_move[i].get('dog_id', '')
+                        dog2_id = dogs_to_move[j].get('dog_id', '')
+                        if dog1_id and dog2_id:
+                            time = self.get_time_with_fallback(dog1_id, dog2_id)
+                            if time < float('inf'):
+                                current_total_time += time
+                
+                # Try to move each dog
+                group_moves = 0
+                for dog in dogs_to_move:
+                    dog_name = dog.get('dog_name', 'Unknown')
+                    dog_id = dog.get('dog_id', '')
+                    
+                    if not dog.get('combined') or ':' not in dog.get('combined', ''):
+                        print(f"   ❌ {dog_name}: Invalid assignment format")
+                        continue
+                    
+                    # Find all potential destinations
+                    options = []
+                    
+                    for other_driver in self.active_drivers:
+                        if other_driver == driver:
+                            continue
+                        
+                        try:
+                            # Get capacity info
+                            capacity_info = self.calculate_driver_density(other_driver)
+                            capacity = capacity_info['capacity']
+                            
+                            # Count dogs in this group for other driver
+                            other_group_dogs = []
+                            if self.dog_assignments:  # Check if there are assignments
+                                for assignment in self.dog_assignments:
+                                    if (isinstance(assignment, dict) and 
+                                        assignment.get('combined', '').startswith(f"{other_driver}:") and
+                                        group_num in self.parse_dog_groups_from_callout(
+                                            assignment.get('combined', '').split(':', 1)[1] if ':' in assignment.get('combined', '') else '')):
+                                        other_group_dogs.append(assignment)
+                            
+                            available_capacity = capacity - len(other_group_dogs)
+                            
+                            # Only process if there's capacity
+                            if available_capacity > 0:
+                                # Find closest dog in other driver's group
+                                min_time = float('inf')
+                                closest_dog_name = None
+                                
+                                if other_group_dogs:  # Only if there are dogs to compare to
+                                    for other_dog in other_group_dogs:
+                                        other_id = other_dog.get('dog_id', '')
+                                        if other_id and dog_id:
+                                            time = self.get_time_with_fallback(dog_id, other_id)
+                                            if time < min_time:
+                                                min_time = time
+                                                closest_dog_name = other_dog.get('dog_name', 'Unknown')
+                                else:
+                                    # Empty group - use a default time
+                                    min_time = 5.0  # Assume 5 minutes for empty groups
+                                    closest_dog_name = "Empty group"
+                                
+                                if min_time < float('inf'):
+                                    options.append({
+                                        'driver': other_driver,
+                                        'time': min_time,
+                                        'capacity': available_capacity,
+                                        'closest_dog': closest_dog_name
+                                    })
+                        except Exception as e:
+                            print(f"   ⚠️  Error processing {other_driver}: {e}")
+                            continue
+                    
+                    # Sort options by time, but consider ties
+                    if options:
+                        options.sort(key=lambda x: x['time'])
+                        
+                        # Find all options within 1 minute of best
+                        best_time = options[0]['time']
+                        tied_options = [opt for opt in options if opt['time'] <= best_time + 1]
+                        
+                        # Among tied options, choose one with most capacity
+                        if tied_options:
+                            tied_options.sort(key=lambda x: -x['capacity'])
+                            best_option = tied_options[0]
+                            
+                            # Calculate time increase more accurately
+                            # Current setup: all dogs in small group travel together
+                            # New setup: this dog travels with new group
+                            # Increase is roughly the distance to new group
+                            time_increase = best_option['time']
+                            
+                            if time_increase < self.GROUP_CONSOLIDATION_TIME_LIMIT:
+                                combined = dog.get('combined', '')
+                                if ':' in combined:
+                                    original_groups = combined.split(':', 1)[1]
+                                    dog['combined'] = f"{best_option['driver']}:{original_groups}"
+                                    print(f"   ✅ {dog_name} → {best_option['driver']} "
+                                          f"(closest to {best_option['closest_dog']}, "
+                                          f"{best_option['time']:.1f} min, "
+                                          f"+{time_increase:.1f} min total)")
+                                    moves_made += 1
+                                    group_moves += 1
+                            else:
+                                print(f"   ❌ {dog_name}: Would increase time by {time_increase:.1f} min "
+                                      f"(limit: {self.GROUP_CONSOLIDATION_TIME_LIMIT} min)")
+                        else:
+                            print(f"   ❌ {dog_name}: No options within tie threshold")
+                    else:
+                        print(f"   ❌ {dog_name}: No suitable destination found")
+                
+                if group_moves == 0:
+                    print(f"   ℹ️  Could not consolidate any dogs from this small group")
+        
+        print(f"\n✅ Phase 5 Complete: {moves_made} dogs moved from small groups")
+        return moves_made
+        """NEW PHASE 5: Consolidate small groups with constraints
+        
+        - Only move if total drive time increase < 10 minutes
+        - Choose neighbor with most space when there's a tie
+        """
+        print("\n🔄 PHASE 5: Consolidating small groups (< 4 dogs) with constraints")
+        print("=" * 60)
+        
+        moves_made = 0
+        
+        for driver in list(self.active_drivers):
+            driver_groups = defaultdict(list)
+            
+            for assignment in self.dog_assignments:
+                if isinstance(assignment, dict) and assignment.get('combined', '').startswith(f"{driver}:"):
+                    combined = assignment.get('combined', '')
+                    if ':' in combined:
+                        groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
+                        for group in groups:
+                            driver_groups[group].append(assignment)
+            
+            # Check which groups exist
+            has_group1 = 1 in driver_groups and len(driver_groups[1]) > 0
+            has_group2 = 2 in driver_groups and len(driver_groups[2]) > 0
+            has_group3 = 3 in driver_groups and len(driver_groups[3]) > 0
+            
+            # Only consolidate if driver has all 3 groups
+            if not (has_group1 and has_group2 and has_group3):
+                continue
+            
+            # Check Group 1 and Group 3 for small size
+            for group_num in [1, 3]:
+                if group_num not in driver_groups:
+                    continue
+                    
                 if len(driver_groups[group_num]) < self.MIN_GROUP_SIZE:
                     dogs_to_move = driver_groups[group_num]
                     print(f"\n📊 {driver} Group {group_num} has only {len(dogs_to_move)} dogs")
@@ -1173,47 +1332,53 @@ class DogReassignmentSystem:
                             if other_driver == driver:
                                 continue
                             
-                            # Get capacity info
-                            capacity_info = self.calculate_driver_density(other_driver)
-                            capacity = capacity_info['capacity']
-                            
-                            # Count dogs in this group for other driver
-                            other_group_dogs = []
-                            for assignment in self.dog_assignments:
-                                if (isinstance(assignment, dict) and 
-                                    assignment.get('combined', '').startswith(f"{other_driver}:") and
-                                    group_num in self.parse_dog_groups_from_callout(
-                                        assignment.get('combined', '').split(':', 1)[1] if ':' in assignment.get('combined', '') else '')):
-                                    other_group_dogs.append(assignment)
-                            
-                            available_capacity = capacity - len(other_group_dogs)
-                            
-                            # Only process if there's capacity
-                            if available_capacity > 0:
-                                # Find closest dog in other driver's group
-                                min_time = float('inf')
-                                closest_dog_name = None
+                            try:
+                                # Get capacity info
+                                capacity_info = self.calculate_driver_density(other_driver)
+                                capacity = capacity_info.get('capacity', 8)
                                 
-                                if other_group_dogs:  # Only if there are dogs to compare to
-                                    for other_dog in other_group_dogs:
-                                        other_id = other_dog.get('dog_id', '')
-                                        if other_id and dog_id:
-                                            time = self.get_time_with_fallback(dog_id, other_id)
-                                            if time < min_time:
-                                                min_time = time
-                                                closest_dog_name = other_dog.get('dog_name', 'Unknown')
-                                else:
-                                    # Empty group - use a default time
-                                    min_time = 5.0  # Assume 5 minutes for empty groups
-                                    closest_dog_name = "Empty group"
+                                # Count dogs in this group for other driver
+                                other_group_dogs = []
+                                for assignment in self.dog_assignments:
+                                    if (isinstance(assignment, dict) and 
+                                        assignment.get('combined', '').startswith(f"{other_driver}:") and
+                                        ':' in assignment.get('combined', '')):
+                                        assignment_groups = self.parse_dog_groups_from_callout(
+                                            assignment.get('combined', '').split(':', 1)[1])
+                                        if group_num in assignment_groups:
+                                            other_group_dogs.append(assignment)
                                 
-                                if min_time < float('inf'):
-                                    options.append({
-                                        'driver': other_driver,
-                                        'time': min_time,
-                                        'capacity': available_capacity,
-                                        'closest_dog': closest_dog_name
-                                    })
+                                available_capacity = capacity - len(other_group_dogs)
+                                
+                                # Only process if there's capacity
+                                if available_capacity > 0:
+                                    # Find closest dog in other driver's group
+                                    min_time = float('inf')
+                                    closest_dog_name = None
+                                    
+                                    if len(other_group_dogs) > 0:
+                                        for other_dog in other_group_dogs:
+                                            other_id = other_dog.get('dog_id', '')
+                                            if other_id and dog_id:
+                                                time = self.get_time_with_fallback(dog_id, other_id)
+                                                if time < min_time:
+                                                    min_time = time
+                                                    closest_dog_name = other_dog.get('dog_name', 'Unknown')
+                                    else:
+                                        # Empty group - use default time
+                                        min_time = 5.0
+                                        closest_dog_name = "Empty group"
+                                    
+                                    if min_time < float('inf'):
+                                        options.append({
+                                            'driver': other_driver,
+                                            'time': min_time,
+                                            'capacity': available_capacity,
+                                            'closest_dog': closest_dog_name
+                                        })
+                            except Exception as e:
+                                print(f"   ⚠️  Error processing {other_driver}: {e}")
+                                continue
                         
             # Find all options within 1 minute of best
             if options:
