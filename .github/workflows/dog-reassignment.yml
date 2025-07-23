@@ -1,4 +1,4 @@
-name: Run Dog Assignment Script
+name: Run Optimization
 
 on:
   workflow_dispatch:
@@ -6,33 +6,11 @@ on:
     branches: [ main ]
 
 jobs:
-  optimize:
+  run:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
+    - uses: actions/checkout@v3
+    - run: |
         pip install gspread oauth2client requests
-    
-    - name: Create credentials.json
-      env:
-        CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-      run: |
-        echo "$CREDENTIALS" > credentials.json
-        ls -la credentials.json  # Verify file was created
-    
-    - name: Run optimization
-      run: python production_reassignment.py
-    
-    - name: Clean up
-      if: always()
-      run: rm -f credentials.json
+        echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+        python production_reassignment.py
