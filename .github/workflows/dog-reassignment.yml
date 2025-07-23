@@ -1,11 +1,8 @@
 name: Update Dog Assignments
 
 on:
-  schedule:
-    - cron: '0 10 * * *'  # Runs at 10 AM UTC daily
-  workflow_dispatch:  # Allows manual trigger from GitHub
-  repository_dispatch:  # Allows trigger via webhook
-    types: [update-dogs]
+  repository_dispatch:
+    types: [m1-changed]
 
 jobs:
   update-assignments:
@@ -28,5 +25,4 @@ jobs:
     - name: Run Dog Assignment Script
       env:
         GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        GITHUB_ACTIONS: 'true'
       run: python production_reassignment.py
