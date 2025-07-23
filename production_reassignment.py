@@ -73,8 +73,8 @@ class DogReassignmentSystem:
             client = gspread.authorize(creds)
 
             # Open spreadsheets
-            self.map_sheet = client.open("DoggyDates Schedule").worksheet("Map 4")
-            self.matrix_sheet = client.open("Matrix").worksheet("Matrix 15")
+            self.map_sheet = client.open("DoggyDates Schedule").worksheet("Map")
+            self.matrix_sheet = client.open("Matrix").worksheet("Matrix")
 
             print("✅ Connected to Google Sheets successfully")
 
