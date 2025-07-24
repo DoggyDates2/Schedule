@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dog Walking Route Optimization System - Version 2
-With Force Assignment and Dynamic Cascading
+Dog Walking Route Optimization System - Version 2.1
+With Enhanced Cascading and State Rollback
 """
 
 import os
@@ -34,7 +34,7 @@ class DogReassignmentSystem:
     def __init__(self):
         print("=" * 60)
         print("DOG WALKING ROUTE OPTIMIZATION SYSTEM")
-        print("Version 2.0 - Force Assignment & Dynamic Cascading")
+        print("Version 2.1 - Enhanced Cascading with State Rollback")
         print("=" * 60)
         
         # Configuration
@@ -1178,86 +1178,304 @@ class DogReassignmentSystem:
         return moves_made
     
     def phase7_dynamic_handle_over_capacity(self):
-        """Phase 7: Handle over-capacity with dynamic cascading"""
-        print("\n⚖️ PHASE 7: Dynamic over-capacity handling with cascading")
+        """Phase 7: Handle over-capacity with sophisticated cascading and rollback"""
+        print("\n⚖️ PHASE 7: Dynamic cascading with state tracking and rollback")
         print("=" * 60)
         
+        # Save initial state
+        initial_state = self._save_current_state()
+        initial_metrics = self._calculate_state_metrics()
+        
+        print("\n📊 Initial State Metrics:")
+        print(f"   Over-capacity groups: {initial_metrics['over_capacity_count']}")
+        print(f"   Total excess dogs: {initial_metrics['total_excess']}")
+        print(f"   Average route density: {initial_metrics['avg_density']:.2f} min")
+        
         moves_made = 0
-        max_iterations = 100  # Prevent infinite loops
+        max_iterations = 100
         iteration = 0
+        NEARBY_THRESHOLD = 2.0
+        
+        # Track best state during optimization
+        best_state = initial_state.copy()
+        best_metrics = initial_metrics.copy()
+        best_iteration = 0
+        
+        # Track if we're making progress
+        iterations_without_improvement = 0
+        max_iterations_without_improvement = 10
         
         while iteration < max_iterations:
             iteration += 1
             
-            # Find the first over-capacity group
-            over_capacity_group = self._find_over_capacity_group()
+            # Find ALL over-capacity groups
+            over_capacity_groups = self._find_all_over_capacity_groups()
             
-            if not over_capacity_group:
-                print(f"\n✅ All groups within capacity after {moves_made} moves!")
+            if not over_capacity_groups:
+                print(f"\n✅ All groups balanced after {moves_made} moves!")
                 break
-                
-            driver = over_capacity_group['driver']
-            group_num = over_capacity_group['group_num']
-            current_count = over_capacity_group['current_count']
-            capacity = over_capacity_group['capacity']
-            dogs = over_capacity_group['dogs']
             
-            print(f"\n🔍 Iteration {iteration}: {driver} Group {group_num} is over capacity ({current_count}/{capacity})")
+            # Sort by severity (most over-capacity first)
+            over_capacity_groups.sort(key=lambda x: x['over_by'], reverse=True)
             
-            # Find outliers in this group (dogs with no close neighbors)
-            outliers = self._find_outliers_by_connectivity(dogs, group_num)
+            # Process the most over-capacity group
+            group_info = over_capacity_groups[0]
+            driver = group_info['driver']
+            group_num = group_info['group_num']
+            current_count = group_info['current_count']
+            capacity = group_info['capacity']
+            dogs = group_info['dogs']
+            
+            print(f"\n🔍 Iteration {iteration}: {driver} Group {group_num} is over by {group_info['over_by']} dogs ({current_count}/{capacity})")
+            
+            # Save checkpoint before making moves
+            checkpoint_state = self._save_current_state()
+            
+            # Find outliers (dogs with fewest close neighbors)
+            outliers = self._find_outliers_by_neighbor_count(dogs, NEARBY_THRESHOLD)
             
             if not outliers:
-                print(f"   ⚠️ No outliers found in over-capacity group. Breaking to avoid infinite loop.")
-                break
-                
-            # Sort outliers by how isolated they are
-            outliers.sort(key=lambda x: x['isolation_score'], reverse=True)
+                print(f"   ⚠️ No outliers found. Selecting furthest dog instead.")
+                outliers = self._find_furthest_dogs(dogs)
             
-            # Move the most isolated outlier
+            if not outliers:
+                print(f"   ❌ Cannot find any dogs to move. Breaking.")
+                break
+            
+            # Process the most isolated outlier
             outlier = outliers[0]
             dog_name = outlier['dog']['dog_name']
-            dog_id = outlier['dog']['dog_id']
             
-            print(f"   🎯 Moving outlier: {dog_name} (isolation score: {outlier['isolation_score']:.1f})")
+            print(f"\n   🎯 Processing outlier: {dog_name}")
+            print(f"      Close neighbors: {outlier['close_neighbors']}")
+            print(f"      Min distance: {outlier['min_distance']:.1f} min")
             
-            # Find best destination
-            best_destination = self._find_best_destination_dynamic(
-                outlier['dog'], group_num, current_driver=driver
+            # Find ALL nearby dogs in other drivers
+            nearby_options = self._find_all_nearby_destinations(
+                outlier['dog'], group_num, current_driver=driver, 
+                threshold=NEARBY_THRESHOLD
             )
             
-            if not best_destination:
-                print(f"   ❌ No valid destination found for {dog_name}")
+            if not nearby_options:
+                print(f"   ❌ No nearby dogs found within {NEARBY_THRESHOLD} minutes")
+                # Expand search radius
+                nearby_options = self._find_all_nearby_destinations(
+                    outlier['dog'], group_num, current_driver=driver, 
+                    threshold=5.0
+                )
+            
+            if not nearby_options:
+                print(f"   ❌ No valid destinations found at all")
+                # Restore checkpoint if no progress made
+                self._restore_state(checkpoint_state)
                 continue
+            
+            # Sort options by available space (most space first), then by distance
+            nearby_options.sort(key=lambda x: (-x['available_capacity'], x['min_distance']))
+            
+            # Execute cascading move
+            move_success = self._execute_cascading_move(
+                outlier['dog'], group_num, driver, nearby_options, 
+                moves_made, max_moves=max_iterations - moves_made
+            )
+            
+            if move_success:
+                moves_made += move_success
                 
-            # Execute the move
-            new_driver = best_destination['driver']
-            new_combined = f"{new_driver}:{group_num}"
-            
-            print(f"   ✅ Moving {dog_name}: {driver} → {new_driver}")
-            print(f"      Distance: {best_destination['distance']:.1f} min")
-            print(f"      {new_driver}'s available capacity: {best_destination['available_capacity']}")
-            
-            # Update the assignment
-            outlier['dog']['combined'] = new_combined
-            self._update_assignment_on_sheet(outlier['dog'])
-            moves_made += 1
-            
-            # CRITICAL: Re-evaluate everything after this move
-            print(f"   🔄 Re-evaluating all groups after move...")
-            
+                # Calculate new metrics
+                current_metrics = self._calculate_state_metrics()
+                
+                print(f"\n   🔄 Cascading complete. {move_success} moves made this iteration.")
+                print(f"   📊 Current metrics:")
+                print(f"      Over-capacity groups: {current_metrics['over_capacity_count']}")
+                print(f"      Total excess: {current_metrics['total_excess']}")
+                print(f"      Avg density: {current_metrics['avg_density']:.2f} min")
+                
+                # Check if this is an improvement
+                if self._is_better_state(current_metrics, best_metrics):
+                    print(f"   ✨ New best state found!")
+                    best_state = self._save_current_state()
+                    best_metrics = current_metrics.copy()
+                    best_iteration = iteration
+                    iterations_without_improvement = 0
+                else:
+                    iterations_without_improvement += 1
+                    print(f"   ⚠️ No improvement ({iterations_without_improvement} iterations without improvement)")
+                
+                # Check if we should stop due to lack of progress
+                if iterations_without_improvement >= max_iterations_without_improvement:
+                    print(f"\n⚠️ No improvement for {max_iterations_without_improvement} iterations. Stopping.")
+                    break
+                    
+            else:
+                print(f"   ❌ Cascading move failed")
+                # Restore checkpoint
+                self._restore_state(checkpoint_state)
+                iterations_without_improvement += 1
+        
+        # Final evaluation
+        final_metrics = self._calculate_state_metrics()
+        
+        print("\n" + "=" * 60)
+        print("📊 FINAL EVALUATION")
+        print("=" * 60)
+        
+        print("\nInitial state:")
+        print(f"   Over-capacity groups: {initial_metrics['over_capacity_count']}")
+        print(f"   Total excess: {initial_metrics['total_excess']}")
+        print(f"   Avg density: {initial_metrics['avg_density']:.2f} min")
+        
+        print("\nFinal state:")
+        print(f"   Over-capacity groups: {final_metrics['over_capacity_count']}")
+        print(f"   Total excess: {final_metrics['total_excess']}")
+        print(f"   Avg density: {final_metrics['avg_density']:.2f} min")
+        
+        print(f"\nBest state (iteration {best_iteration}):")
+        print(f"   Over-capacity groups: {best_metrics['over_capacity_count']}")
+        print(f"   Total excess: {best_metrics['total_excess']}")
+        print(f"   Avg density: {best_metrics['avg_density']:.2f} min")
+        
+        # Decide whether to keep current state or rollback
+        if self._is_better_state(final_metrics, initial_metrics):
+            print("\n✅ Final state is better than initial. Keeping changes.")
+        elif self._is_better_state(best_metrics, initial_metrics):
+            print("\n🔄 Rolling back to best intermediate state...")
+            self._restore_state(best_state)
+            print("✅ Restored to best state from iteration", best_iteration)
+        else:
+            print("\n⚠️ WARNING: Optimization made things worse!")
+            print("🔄 Rolling back to initial state...")
+            self._restore_state(initial_state)
+            print("✅ Restored to initial state")
+            moves_made = 0
+        
         if iteration >= max_iterations:
-            print(f"\n⚠️ Reached maximum iterations ({max_iterations}). Stopping to prevent infinite loop.")
-            
+            print(f"\n⚠️ Reached maximum iterations ({max_iterations})")
+        
         return moves_made
     
-    def _find_over_capacity_group(self):
-        """Find the first over-capacity group"""
+    def _save_current_state(self):
+        """Save the current state of all assignments"""
+        state = {}
+        for assignment in self.dog_assignments:
+            if isinstance(assignment, dict) and 'row_index' in assignment:
+                state[assignment['row_index']] = {
+                    'combined': assignment.get('combined', ''),
+                    'dog_id': assignment.get('dog_id', ''),
+                    'dog_name': assignment.get('dog_name', '')
+                }
+        return state
+    
+    def _restore_state(self, saved_state):
+        """Restore assignments from a saved state"""
+        for assignment in self.dog_assignments:
+            if isinstance(assignment, dict) and 'row_index' in assignment:
+                row_index = assignment['row_index']
+                if row_index in saved_state:
+                    assignment['combined'] = saved_state[row_index]['combined']
+    
+    def _calculate_state_metrics(self):
+        """Calculate metrics to evaluate the quality of the current state"""
+        metrics = {
+            'over_capacity_count': 0,
+            'total_excess': 0,
+            'avg_density': 0,
+            'total_outliers': 0,
+            'unassigned_count': 0
+        }
+        
+        total_density = 0
+        density_count = 0
+        
+        for driver in self.active_drivers:
+            capacity_info = self.calculate_driver_density(driver)
+            capacity = capacity_info['capacity']
+            avg_time = capacity_info['avg_time']
+            
+            if avg_time > 0:
+                total_density += avg_time
+                density_count += 1
+            
+            # Check each group
+            for group_num in [1, 2, 3]:
+                group_dogs = []
+                for assignment in self.dog_assignments:
+                    if not isinstance(assignment, dict):
+                        continue
+                    combined = assignment.get('combined', '')
+                    if not combined.startswith(f"{driver}:"):
+                        continue
+                    if ':' in combined:
+                        groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
+                        if group_num in groups:
+                            group_dogs.append(assignment)
+                
+                current_count = len(group_dogs)
+                if current_count > capacity:
+                    metrics['over_capacity_count'] += 1
+                    metrics['total_excess'] += (current_count - capacity)
+                
+                # Count outliers
+                if len(group_dogs) >= 3:
+                    outliers = self._find_outliers_by_neighbor_count(group_dogs, 2.0)
+                    for outlier in outliers:
+                        if outlier['close_neighbors'] == 0:
+                            metrics['total_outliers'] += 1
+        
+        # Count unassigned
+        for assignment in self.dog_assignments:
+            if isinstance(assignment, dict) and not assignment.get('combined', '').strip():
+                if assignment.get('callout', '').strip():
+                    metrics['unassigned_count'] += 1
+        
+        if density_count > 0:
+            metrics['avg_density'] = total_density / density_count
+        
+        return metrics
+    
+    def _is_better_state(self, metrics1, metrics2):
+        """Compare two states and return True if metrics1 is better than metrics2"""
+        # Priority order:
+        # 1. Fewer unassigned dogs (highest priority)
+        # 2. Fewer over-capacity groups
+        # 3. Lower total excess
+        # 4. Fewer outliers
+        # 5. Better density (lower is better)
+        
+        if metrics1['unassigned_count'] < metrics2['unassigned_count']:
+            return True
+        elif metrics1['unassigned_count'] > metrics2['unassigned_count']:
+            return False
+        
+        if metrics1['over_capacity_count'] < metrics2['over_capacity_count']:
+            return True
+        elif metrics1['over_capacity_count'] > metrics2['over_capacity_count']:
+            return False
+        
+        if metrics1['total_excess'] < metrics2['total_excess']:
+            return True
+        elif metrics1['total_excess'] > metrics2['total_excess']:
+            return False
+        
+        if metrics1['total_outliers'] < metrics2['total_outliers']:
+            return True
+        elif metrics1['total_outliers'] > metrics2['total_outliers']:
+            return False
+        
+        # For density, lower is better
+        if metrics1['avg_density'] < metrics2['avg_density']:
+            return True
+        
+        return False
+    
+    def _find_all_over_capacity_groups(self):
+        """Find all over-capacity groups"""
+        over_capacity_groups = []
+        
         for driver in self.active_drivers:
             capacity_info = self.calculate_driver_density(driver)
             capacity = capacity_info['capacity']
             
-            # Check each group
             for group_num in [1, 2, 3]:
                 dogs = []
                 for assignment in self.dog_assignments:
@@ -1266,90 +1484,125 @@ class DogReassignmentSystem:
                     combined = assignment.get('combined', '')
                     if not combined.startswith(f"{driver}:"):
                         continue
-                    if ':' not in combined:
-                        continue
-                    combined_parts = combined.split(':', 1)
-                    if len(combined_parts) >= 2:
-                        groups = self.parse_dog_groups_from_callout(combined_parts[1])
+                    if ':' in combined:
+                        groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
                         if group_num in groups:
                             dogs.append(assignment)
                 
                 current_count = len(dogs)
                 if current_count > capacity:
-                    return {
+                    over_capacity_groups.append({
                         'driver': driver,
                         'group_num': group_num,
                         'current_count': current_count,
                         'capacity': capacity,
+                        'over_by': current_count - capacity,
                         'dogs': dogs
-                    }
+                    })
         
-        return None
+        return over_capacity_groups
     
-    def _find_outliers_by_connectivity(self, dogs, group_num):
-        """Find outliers based on connectivity (dogs with no close neighbors)"""
+    def _find_outliers_by_neighbor_count(self, dogs, threshold):
+        """Find outliers based on number of close neighbors"""
         outliers = []
-        CLOSE_NEIGHBOR_THRESHOLD = 3.0  # minutes
         
         for i, dog in enumerate(dogs):
             dog_id = dog.get('dog_id', '')
             if not dog_id:
                 continue
-                
-            # Count close neighbors
+            
             close_neighbors = 0
-            min_neighbor_distance = float('inf')
+            min_distance = float('inf')
+            distances = []
             
             for j, other_dog in enumerate(dogs):
                 if i == j:
                     continue
-                    
+                
                 other_id = other_dog.get('dog_id', '')
                 if not other_id:
                     continue
-                    
-                distance = self.get_time_with_fallback(dog_id, other_id)
                 
-                if distance < CLOSE_NEIGHBOR_THRESHOLD:
+                distance = self.get_time_with_fallback(dog_id, other_id)
+                distances.append(distance)
+                
+                if distance <= threshold:
                     close_neighbors += 1
-                    
-                if distance < min_neighbor_distance:
-                    min_neighbor_distance = distance
+                
+                if distance < min_distance:
+                    min_distance = distance
             
-            # Calculate isolation score
-            isolation_score = (1 / (close_neighbors + 1)) * min_neighbor_distance
+            avg_distance = sum(distances) / len(distances) if distances else float('inf')
             
-            if close_neighbors == 0:  # True outlier with no close neighbors
-                outliers.append({
-                    'dog': dog,
-                    'close_neighbors': close_neighbors,
-                    'min_neighbor_distance': min_neighbor_distance,
-                    'isolation_score': isolation_score
-                })
+            outliers.append({
+                'dog': dog,
+                'close_neighbors': close_neighbors,
+                'min_distance': min_distance,
+                'avg_distance': avg_distance,
+                'isolation_score': (1 / (close_neighbors + 1)) * avg_distance
+            })
+        
+        # Sort by isolation score (most isolated first)
+        outliers.sort(key=lambda x: x['isolation_score'], reverse=True)
         
         return outliers
     
-    def _find_best_destination_dynamic(self, dog, group_num, current_driver):
-        """Find best destination considering available space for tie-breaking"""
+    def _find_furthest_dogs(self, dogs):
+        """Find dogs that are furthest from group center"""
+        if len(dogs) < 2:
+            return dogs
+        
+        results = []
+        
+        for dog in dogs:
+            dog_id = dog.get('dog_id', '')
+            if not dog_id:
+                continue
+            
+            total_distance = 0
+            count = 0
+            
+            for other_dog in dogs:
+                other_id = other_dog.get('dog_id', '')
+                if other_id and other_id != dog_id:
+                    distance = self.get_time_with_fallback(dog_id, other_id)
+                    if distance < float('inf'):
+                        total_distance += distance
+                        count += 1
+            
+            avg_distance = total_distance / count if count > 0 else 0
+            
+            results.append({
+                'dog': dog,
+                'close_neighbors': 0,
+                'min_distance': avg_distance,
+                'avg_distance': avg_distance,
+                'isolation_score': avg_distance
+            })
+        
+        results.sort(key=lambda x: x['avg_distance'], reverse=True)
+        return results
+    
+    def _find_all_nearby_destinations(self, dog, group_num, current_driver, threshold):
+        """Find ALL dogs within threshold distance in other drivers"""
         dog_id = dog.get('dog_id', '')
         if not dog_id:
-            return None
-            
-        destinations = []
-        SIMILAR_DISTANCE_THRESHOLD = 1.0
+            return []
         
+        destinations = {}  # driver -> info
+        
+        # Check all other drivers
         for driver in self.active_drivers:
             if driver == current_driver:
                 continue
-                
+            
             # Get capacity info
             capacity_info = self.calculate_driver_density(driver)
             capacity = capacity_info['capacity']
             
-            # Count current dogs in this group
+            # Find all nearby dogs in this driver's group
+            nearby_dogs = []
             current_count = 0
-            closest_dog = None
-            min_distance = float('inf')
             
             for assignment in self.dog_assignments:
                 if not isinstance(assignment, dict):
@@ -1357,52 +1610,146 @@ class DogReassignmentSystem:
                 combined = assignment.get('combined', '')
                 if not combined.startswith(f"{driver}:"):
                     continue
-                if ':' not in combined:
-                    continue
-                combined_parts = combined.split(':', 1)
-                if len(combined_parts) >= 2:
-                    groups = self.parse_dog_groups_from_callout(combined_parts[1])
+                if ':' in combined:
+                    groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
                     if group_num in groups:
                         current_count += 1
                         
-                        # Find closest dog
                         other_id = assignment.get('dog_id', '')
                         if other_id:
                             distance = self.get_time_with_fallback(dog_id, other_id)
-                            if distance < min_distance:
-                                min_distance = distance
-                                closest_dog = assignment.get('dog_name', 'Unknown')
+                            if distance <= threshold:
+                                nearby_dogs.append({
+                                    'dog': assignment,
+                                    'distance': distance
+                                })
             
-            # If no dogs in group, estimate distance
-            if min_distance == float('inf'):
-                min_distance = 10.0
+            if nearby_dogs:
+                # Sort by distance
+                nearby_dogs.sort(key=lambda x: x['distance'])
                 
-            available_capacity = capacity - current_count
-            
-            destinations.append({
-                'driver': driver,
-                'distance': min_distance,
-                'available_capacity': available_capacity,
-                'current_count': current_count,
-                'closest_dog': closest_dog
-            })
+                destinations[driver] = {
+                    'driver': driver,
+                    'nearby_dogs': nearby_dogs,
+                    'nearby_count': len(nearby_dogs),
+                    'min_distance': nearby_dogs[0]['distance'],
+                    'current_count': current_count,
+                    'capacity': capacity,
+                    'available_capacity': capacity - current_count
+                }
         
-        if not destinations:
-            return None
-            
-        # Sort by distance first
-        destinations.sort(key=lambda x: x['distance'])
+        # Convert to list
+        return list(destinations.values())
+    
+    def _execute_cascading_move(self, dog, group_num, from_driver, destinations, 
+                               current_moves, max_moves, cascade_depth=0):
+        """Execute a move with cascading if necessary"""
         
-        # Find all destinations within similar distance
-        best_distance = destinations[0]['distance']
-        similar_destinations = [d for d in destinations 
-                              if d['distance'] <= best_distance + SIMILAR_DISTANCE_THRESHOLD]
+        if cascade_depth > 10:  # Prevent infinite recursion
+            print(f"   ⚠️ Max cascade depth reached")
+            return 0
         
-        # Among similar distances, pick the one with most available space
-        if len(similar_destinations) > 1:
-            similar_destinations.sort(key=lambda x: x['available_capacity'], reverse=True)
+        if current_moves >= max_moves:
+            print(f"   ⚠️ Max moves reached")
+            return 0
+        
+        dog_name = dog.get('dog_name', 'Unknown')
+        dog_id = dog.get('dog_id', '')
+        
+        # Try each destination
+        for dest in destinations:
+            to_driver = dest['driver']
+            available_capacity = dest['available_capacity']
             
-        return similar_destinations[0]
+            print(f"\n   📍 Trying {to_driver} (space: {available_capacity}, "
+                  f"nearby dogs: {dest['nearby_count']})")
+            
+            if available_capacity > 0:
+                # Space available - direct move
+                print(f"   ✅ Space available. Moving {dog_name} to {to_driver}")
+                
+                # Update assignment
+                dog['combined'] = f"{to_driver}:{group_num}"
+                self._update_assignment_on_sheet(dog)
+                
+                return 1  # One move made
+            
+            else:
+                # No space - need to cascade
+                print(f"   ⚠️ {to_driver} is full. Initiating cascade...")
+                
+                # Find outliers in destination group
+                dest_dogs = []
+                for assignment in self.dog_assignments:
+                    if not isinstance(assignment, dict):
+                        continue
+                    combined = assignment.get('combined', '')
+                    if not combined.startswith(f"{to_driver}:"):
+                        continue
+                    if ':' in combined:
+                        groups = self.parse_dog_groups_from_callout(combined.split(':', 1)[1])
+                        if group_num in groups:
+                            dest_dogs.append(assignment)
+                
+                # Find outlier to move out
+                dest_outliers = self._find_outliers_by_neighbor_count(dest_dogs, 2.0)
+                
+                if not dest_outliers:
+                    print(f"   ❌ No outliers found in {to_driver} to cascade")
+                    continue
+                
+                # Find destinations for the outlier
+                dest_outlier = dest_outliers[0]
+                dest_outlier_name = dest_outlier['dog']['dog_name']
+                
+                print(f"   🔄 Attempting to cascade {dest_outlier_name} out of {to_driver}")
+                
+                # Find new destinations for this outlier
+                cascade_destinations = self._find_all_nearby_destinations(
+                    dest_outlier['dog'], group_num, current_driver=to_driver, 
+                    threshold=3.0
+                )
+                
+                # Remove the original source driver from options
+                cascade_destinations = [d for d in cascade_destinations 
+                                       if d['driver'] != from_driver]
+                
+                if not cascade_destinations:
+                    print(f"   ❌ No cascade destinations for {dest_outlier_name}")
+                    continue
+                
+                # Sort by space
+                cascade_destinations.sort(key=lambda x: -x['available_capacity'])
+                
+                # Try cascading move
+                cascade_moves = self._execute_cascading_move(
+                    dest_outlier['dog'], group_num, to_driver, 
+                    cascade_destinations, current_moves + 1, max_moves, 
+                    cascade_depth + 1
+                )
+                
+                if cascade_moves > 0:
+                    # Cascade successful - now move original dog
+                    print(f"   ✅ Cascade successful! Now moving {dog_name} to {to_driver}")
+                    dog['combined'] = f"{to_driver}:{group_num}"
+                    self._update_assignment_on_sheet(dog)
+                    
+                    return cascade_moves + 1
+                else:
+                    print(f"   ❌ Cascade failed for {to_driver}")
+                    continue
+        
+        # If we get here, no moves were possible
+        # As a last resort, force move to the best destination anyway
+        if destinations and cascade_depth == 0:
+            best_dest = destinations[0]
+            print(f"\n   💪 FORCE MOVE: {dog_name} to {best_dest['driver']} "
+                  f"(triggering rebalance)")
+            dog['combined'] = f"{best_dest['driver']}:{group_num}"
+            self._update_assignment_on_sheet(dog)
+            return 1
+        
+        return 0
     
     def _update_driver_assignment_counts(self):
         """Update the count of dogs assigned to each driver"""
